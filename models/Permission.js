@@ -4,8 +4,7 @@ const PermissionSchema = new mongoose.Schema(
   {
     // The user this resource is shared WITH
     sharedwith: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
+      type: mongoose.Schema.Types.ObjectId,ref: 'User',
       required: [true, 'sharedwith user is required'],
     },
     permission: {

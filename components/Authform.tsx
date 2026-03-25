@@ -239,6 +239,20 @@ async function onSubmit(data: FormValues) {
           </Button>
         </Field>
       </CardFooter>
+
+      {/* Google Sign-In Button */}
+      <CardFooter>
+        <Field orientation="horizontal">
+          <Button
+            type="button"
+            variant="secondary"
+                onClick={() => signIn("google", { callbackUrl: "/dashboard" })}
+          >
+            Sign In with Google
+        
+          </Button>
+        </Field>
+      </CardFooter>
     </Card>
   )
 }

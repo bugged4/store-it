@@ -5,27 +5,8 @@ import { useState, useRef, DragEvent, ChangeEvent } from "react";
 
 
 
-const handleFile = async (file: File) => { // `file` is the browser File object
-  const res = await fetch("/api/files/upload", {
-    method: "POST",
-    credentials: "include",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      filename: file.name,    
-      mimeType: file.type,    
-      size: file.size,        
-      folderId: null,
-    }),
-  });
 
-  const data = await res.json();
 
-  await fetch(data.uploadUrl, {
-    method: "PUT",
-    body: file,
-    headers: { "Content-Type": file.type },
-  });
-};
 type UploadStatus = "idle" | "uploading" | "success" | "error";
 
 interface UploadedFile {

@@ -1,16 +1,16 @@
-import { S3Event } from "aws-lambda";
-import mongoose from "mongoose";
-import File from "../models/File";
-import User from "../models/User";
+// lambda/src/handler.ts
+import { S3Event } from 'aws-lambda';
+import mongoose from 'mongoose';
+import File from '../models/File';
+import User from '../models/User';
 
 let isConnected = false;
 
-// 🔌 Reuse DB connection (VERY IMPORTANT for Lambda performance)
 async function connectDB() {
   if (isConnected) return;
-
   await mongoose.connect(process.env.MONGO_URI!);
   isConnected = true;
+  console.log('✅ MongoDB connected');
 }
 
 export const handler = async (event: S3Event) => {
@@ -18,49 +18,40 @@ export const handler = async (event: S3Event) => {
     await connectDB();
 
     for (const record of event.Records) {
-      const key = decodeURIComponent(record.s3.object.key.replace(/\\+/g, " "));
+      const key = decodeURIComponent(record.s3.object.key.replace(/\+/g, ' '));
+      const actualSize = record.s3.object.size;
 
-      // ⚠️ Metadata comes from S3
-      const metadata = record.s3.object.metadata || {};
+      console.log('📦 S3 upload confirmed for key:', key);
 
-      // ⚠️ Keys are lowercase!
-      const userId = metadata.userid;
-      const filename = metadata.filename;
-      const folderId = metadata.folderid || null;
-      const size = Number(metadata.size || 0);
-      const mimeType = metadata.mimetype;
+      // ✅ Find the pending record by S3 key and mark it active
+      const file = await File.findOneAndUpdate(
+        { storageUrl: key, status: 'pending' },
+        {
+          $set: {
+            status: 'active',
+            size: actualSize,          // use real size from S3 event
+          },
+        },
+        { new: true }
+      );
 
-      if (!userId) {
-        console.log("❌ Missing metadata, skipping...");
+      if (!file) {
+        console.warn('⚠️ No pending file found for key:', key);
         continue;
       }
 
-      console.log("📦 Processing file:", key);
-
-      // ✅ Create file entry
-      await File.create({
-        Filename: filename,
-        mimetype: mimeType,
-        size: size,
-        folders_id: folderId,
-        owner_id: userId,
-        storageUrl: key,
+      // ✅ Update user storage quota
+      await User.findByIdAndUpdate(file.owner_id, {
+        $inc: { storageUsed: actualSize },
       });
 
-      // ✅ Update user quota
-      await User.findByIdAndUpdate(userId, {
-        $inc: { storageUsed: size },
-      });
-
-      console.log("✅ File saved to DB");
+      console.log('✅ File confirmed in DB:', file._id);
     }
 
-    return {
-      statusCode: 200,
-      body: "Success",
-    };
+    return { statusCode: 200, body: 'Success' };
+
   } catch (error) {
-    console.error("🔥 Lambda error:", error);
+    console.error('🔥 Lambda error:', error);
     throw error;
   }
 };

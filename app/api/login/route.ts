@@ -4,6 +4,7 @@ import User from "@/models/User"
 import jwt from "jsonwebtoken"
 import bcrypt from "bcryptjs"
 
+
 const JWT_SECRET = process.env.JWT_SECRET as string
 
 export async function POST(req: NextRequest) {

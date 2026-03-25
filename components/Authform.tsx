@@ -1,11 +1,11 @@
 "use client"
-
+import { useRouter } from 'next/navigation'
 import * as React from "react"
 import { zodResolver } from "@hookform/resolvers/zod"
-import { Controller, useForm } from "react-hook-form"
+import { Controller, useForm, Resolver } from "react-hook-form"
 import { toast } from "sonner"
 import * as z from "zod"
-
+ import { signIn } from "next-auth/react";
 import { Button } from "@/components/ui/button"
 import {
   Card,
@@ -17,93 +17,162 @@ import {
 } from "@/components/ui/card"
 import {
   Field,
-  FieldDescription,
   FieldError,
   FieldGroup,
   FieldLabel,
 } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
-import {
-  InputGroup,
-  InputGroupAddon,
-  InputGroupText,
-  InputGroupTextarea,
-} from "@/components/ui/input-group"
 
-type FormType = "sign-in" | "sign-up";
+type FormType = "sign-up" | "sign-in"
 
-const formSchema= ({formtype}:{formtype :FormType})=>{
-  return z.object({
-  email: z
-    .string()
-    .email("Email should have @")
-    .min(1, "email is required"),
-  username: z
-    .string()
-    .min(3, "Description must be at least 20 characters.")
-    .max(20, "Description must be at most 100 characters.")
-    .regex(/^[a-zA-Z0-9_]+$/, "Username can only contain letters, numbers, and underscores."),
-
-})
+type FormValues = {
+  email: string
+  username?: string
+  password: string
 }
 
-const  Authform=({type}:{type:FormType})=> {
-
-  const schema = formSchema({ formtype: type })
-
-const form = useForm<z.infer<typeof schema>>({
-  resolver: zodResolver(schema),
-  defaultValues:{
-    username:"",
-    email:"",
-  }
+const signInSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(6),
 })
-  
-  
 
-  function onSubmit(data: z.infer<typeof formSchema>) {
-    toast("You submitted the following values:", {
-      description: (
-        <pre className="mt-2 w-[320px] overflow-x-auto rounded-md bg-code p-4 text-code-foreground">
-          <code>{JSON.stringify(data, null, 2)}</code>
-        </pre>
-      ),
-      position: "bottom-right",
-      classNames: {
-        content: "flex flex-col gap-2",
-      },
-      style: {
-        "--border-radius": "calc(var(--radius)  + 4px)",
-      } as React.CSSProperties,
-    })
-    console.log(data)
+const signUpSchema = z.object({
+  email: z.string().email(),
+  username: z.string().min(1, "Username is required"),
+  password: z.string().min(6),
+})
+
+const Authform = () => {
+    const router = useRouter()
+  const [type, setType] = React.useState<FormType>("sign-in")
+
+  const schema = type === "sign-up" ? signUpSchema : signInSchema
+
+  const form = useForm<FormValues>({
+    resolver: zodResolver(schema) as Resolver<FormValues>,
+    defaultValues: {
+      email: "",
+      username: "",
+      password: "",
+    },
+  })
+
+  // Reset form when switching modes
+  const handleTypeSwitch = (newType: FormType) => {
+    setType(newType)
+    form.reset({ email: "", username: "", password: "" })
   }
 
+
+
+
+
+async function onSubmit(data: FormValues) {
+  try {
+    if (type === "sign-up") {
+      // 🟢 REGISTER USER
+      const res = await fetch("/api/register", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(data),
+      });
+
+      const result = await res.json();
+
+      if (!res.ok) {
+        toast.error(result.error || "Signup failed");
+        return;
+      }
+
+      toast.success("Account created!");
+
+      // 🔥 OPTIONAL: auto login after signup
+      await signIn("credentials", {
+        email: data.email,
+        password: data.password,
+        redirect: false,
+      });
+
+      router.push("/dashboard");
+
+    } else {
+      // 🔵 LOGIN USER
+      const res = await signIn("credentials", {
+        email: data.email,
+        password: data.password,
+        redirect: false,
+      });
+
+      if (res?.error) {
+        toast.error(res.error);
+        return;
+      }
+
+      toast.success("Logged in!");
+      router.push("/dashboard");
+    }
+
+  } catch (error) {
+    toast.error("Server error");
+  }
+}
+
+  
 
   return (
     <Card className="w-full sm:max-w-md">
       <CardHeader>
-        <CardTitle>Store it </CardTitle>
+        {/* Toggle Buttons */}
+        <div className="flex w-full rounded-lg border border-input bg-muted p-1 mb-4">
+          <button
+            type="button"
+            onClick={() => handleTypeSwitch("sign-in")}
+            className={`flex-1 rounded-md py-1.5 text-sm font-medium transition-all duration-200 ${
+              type === "sign-in"
+                ? "bg-background text-foreground shadow-sm"
+                : "text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            Sign In
+          </button>
+          <button
+            type="button"
+            onClick={() => handleTypeSwitch("sign-up")}
+            className={`flex-1 rounded-md py-1.5 text-sm font-medium transition-all duration-200 ${
+              type === "sign-up"
+                ? "bg-background text-foreground shadow-sm"
+                : "text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            Sign Up
+          </button>
+        </div>
+
+        <CardTitle>Store it</CardTitle>
         <CardDescription>
-          easily share and store your files.
+          {type === "sign-in"
+            ? "Welcome back! Sign in to your account."
+            : "Create an account to get started."}
         </CardDescription>
       </CardHeader>
+
       <CardContent>
         <form id="form-rhf-demo" onSubmit={form.handleSubmit(onSubmit)}>
           <FieldGroup>
+            {/* Email */}
             <Controller
               name="email"
               control={form.control}
               render={({ field, fieldState }) => (
                 <Field data-invalid={fieldState.invalid}>
-                  <FieldLabel htmlFor="form-rhf-demo-title">
-                    email
-                  </FieldLabel>
+                  <FieldLabel htmlFor="form-rhf-email">Email</FieldLabel>
                   <Input
                     {...field}
-                    id="form-rhf-demo-title"
+                    id="form-rhf-email"
                     aria-invalid={fieldState.invalid}
-                    placeholder="enter your email"
+                    placeholder="Enter your email"
                     autoComplete="off"
                   />
                   {fieldState.invalid && (
@@ -112,29 +181,44 @@ const form = useForm<z.infer<typeof schema>>({
                 </Field>
               )}
             />
+
+            {/* Username — only for sign-up */}
+            {type === "sign-up" && (
+              <Controller
+                control={form.control}
+                name="username"
+                render={({ field, fieldState }) => (
+                  <Field data-invalid={fieldState.invalid}>
+                    <FieldLabel htmlFor="form-rhf-username">Username</FieldLabel>
+                    <Input
+                      {...field}
+                      id="form-rhf-username"
+                      placeholder="Enter your username"
+                      value={field.value ?? ""}
+                      aria-invalid={fieldState.invalid}
+                    />
+                    {fieldState.invalid && (
+                      <FieldError errors={[fieldState.error]} />
+                    )}
+                  </Field>
+                )}
+              />
+            )}
+
+            {/* Password */}
             <Controller
-              name="username"
+              name="password"
               control={form.control}
               render={({ field, fieldState }) => (
                 <Field data-invalid={fieldState.invalid}>
-                  <FieldLabel htmlFor="form-rhf-demo-description">
-                    Username
-                  </FieldLabel>
-                  <InputGroup>
-                    <InputGroupTextarea
-                      {...field}
-                      id="form-rhf-demo-description"
-                      placeholder="debian"
-                      rows={6}
-                      className="min-h-24 resize-none"
-                      aria-invalid={fieldState.invalid}
-                    />
-                    <InputGroupAddon align="block-end">
-                      <InputGroupText className="tabular-nums">
-                        {field.value.length}/100 characters
-                      </InputGroupText>
-                    </InputGroupAddon>
-                  </InputGroup>
+                  <FieldLabel>Password</FieldLabel>
+                  <Input
+                    {...field}
+                    type="password"
+                    placeholder="Enter your password"
+                    value={field.value || ""}
+                    aria-invalid={fieldState.invalid}
+                  />
                   {fieldState.invalid && (
                     <FieldError errors={[fieldState.error]} />
                   )}
@@ -144,17 +228,19 @@ const form = useForm<z.infer<typeof schema>>({
           </FieldGroup>
         </form>
       </CardContent>
+
       <CardFooter>
         <Field orientation="horizontal">
           <Button type="button" variant="outline" onClick={() => form.reset()}>
             Reset
           </Button>
           <Button type="submit" form="form-rhf-demo">
-            Submit
+            {type === "sign-in" ? "Sign In" : "Sign Up"}
           </Button>
         </Field>
       </CardFooter>
     </Card>
   )
 }
+
 export default Authform

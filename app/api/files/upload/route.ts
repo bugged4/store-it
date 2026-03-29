@@ -18,7 +18,7 @@ export async function POST(req: Request) {
   const session = await getServerSession(authOptions);
   if (!session) return Response.json({ error: 'Unauthorized' }, { status: 401 });
 
-  const { filename, mimeType, size, folderId } = await req.json();
+  const { filename, mimeType, size, folderId, hash } = await req.json(); // 👈 accept hash
 
   await connectDB();
 
@@ -27,17 +27,34 @@ export async function POST(req: Request) {
     return Response.json({ error: 'Storage quota exceeded' }, { status: 413 });
   }
 
+  //  Check for duplicate by content hash (same file, same folder)
+  if (hash) {
+    const duplicate = await File.findOne({
+      owner_id: session.user.id,
+      hash,
+      folders_id: folderId || null,
+      status: { $ne: 'pending' },
+    });
+
+    if (duplicate) {
+      return Response.json(
+        { error: 'This file already exists in this folder', existingFile: duplicate },
+        { status: 409 }
+      );
+    }
+  }
+
   const key = `${session.user.id}/${Date.now()}-${filename}`;
 
-  // ✅ Write to MongoDB immediately as "pending"
-  await File.create({
+  const filedoc = await File.create({
     filename,
     mimetype: mimeType,
     size,
+    hash,              // 👈 store the hash
     folders_id: folderId || null,
     owner_id: session.user.id,
     storageUrl: key,
-    status: 'pending',           // 👈 not confirmed yet
+    status: 'pending',
   });
 
   const command = new PutObjectCommand({
@@ -48,5 +65,5 @@ export async function POST(req: Request) {
 
   const presignedUrl = await getSignedUrl(s3, command, { expiresIn: 300 });
 
-  return Response.json({ uploadUrl: presignedUrl, key });
+  return Response.json({ uploadUrl: presignedUrl, key, file: filedoc })
 }

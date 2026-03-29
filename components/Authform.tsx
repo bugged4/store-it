@@ -88,7 +88,7 @@ async function onSubmit(data: FormValues) {
 
       toast.success("Account created!");
 
-      // 🔥 OPTIONAL: auto login after signup
+      //auto login after signup
       await signIn("credentials", {
         email: data.email,
         password: data.password,

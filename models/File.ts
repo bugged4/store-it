@@ -9,7 +9,7 @@ const FileSchema = new Schema({
   folders_id: { type: Schema.Types.ObjectId, default: null },
   owner_id:   { type: Schema.Types.ObjectId, required: true },
   storageUrl: { type: String, required: true },           // the S3 key
-  status:     { type: String, enum: ['pending', 'active'], default: 'pending' },
+  status:     { type: String, enum: ['pending', 'uploaded'], default: 'pending' },
 }, { timestamps: true });
 
 export default mongoose.models.File|| mongoose.model('File', FileSchema);

@@ -27,11 +27,19 @@ export const authOptions: NextAuthOptions = {
         password: { label: 'Password', type: 'password' },
       },
       async authorize(credentials) {
+        console.log("Authorize function called");
+  console.log("Credentials received:", credentials);
+
         if (!credentials?.email || !credentials?.password) {
           throw new Error('Email and password are required');
         }
 
-        await connectDB();
+     try {
+  await connectDB();
+} catch (err) {
+  console.error("Database connection error:", err);
+  throw new Error("Failed to connect to the database");
+}
 
         const user = await User.findOne({
           email: credentials.email.toLowerCase().trim(),

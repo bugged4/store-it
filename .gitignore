@@ -1,7 +1,7 @@
 # See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
 
 # dependencies
-/node_modules
+s3lambda/
 /.pnp
 .pnp.*
 .yarn/*
@@ -9,7 +9,7 @@
 !.yarn/plugins
 !.yarn/releases
 !.yarn/versions
-
+node_modules/   
 # testing
 /coverage
 
@@ -18,7 +18,7 @@
 /out/
 
 # production
-/build
+build/
 
 # misc
 .DS_Store

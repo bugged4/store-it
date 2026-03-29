@@ -1,76 +1,137 @@
 "use client";
 
 import { useState, useRef, DragEvent, ChangeEvent } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 
+type UploadStatus = "idle" | "uploading" | "success" | "error" | "duplicate";
 
-
-
-
-
-type UploadStatus = "idle" | "uploading" | "success" | "error";
-
-interface UploadedFile {
-  name: string;
+type FileType = {
+  _id: string;
+  filename: string;
+  mimetype: string;
   size: number;
-  url?: string;
+  storageUrl: string;
+  owner_id: string;
+  status: "pending" | "uploaded";
+  createdAt: string;
+};
+
+// ✅ Compute SHA-256 hash of file content
+async function getFileHash(file: File): Promise<string> {
+  const buffer = await file.arrayBuffer();
+  const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
+  return Array.from(new Uint8Array(hashBuffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
-
-
 
 export default function FileUpload() {
   const [dragging, setDragging] = useState(false);
   const [status, setStatus] = useState<UploadStatus>("idle");
-  const [uploadedFile, setUploadedFile] = useState<UploadedFile | null>(null);
   const [errorMsg, setErrorMsg] = useState("");
   const [progress, setProgress] = useState(0);
+  const [duplicateFile, setDuplicateFile] = useState<FileType | null>(null); // 👈 store conflict info
   const inputRef = useRef<HTMLInputElement>(null);
 
- const handleFile = async (file: File) => {
-  setStatus("uploading");
-  setProgress(0);
-  setErrorMsg("");
+  const queryClient = useQueryClient();
 
-  try {
-    const interval = setInterval(() => {
-      setProgress((p) => (p < 85 ? p + 10 : p));
-    }, 150);
+  const { data: files = [], isLoading } = useQuery<FileType[]>({
+    queryKey: ["files"],
+    queryFn: async () => {
+      const res = await fetch("/api/files/fetch");
+      return res.json();
+    },
+  });
 
-    // ✅ Step 1: send metadata as JSON → your Next.js API
-    const res = await fetch("/api/files/upload", {
+  const uploadMutation = useMutation({
+    mutationFn: async (file: File) => {
+      // ✅ Compute hash before requesting presigned URL
+      const hash = await getFileHash(file);
+
+      const res = await fetch("/api/files/upload", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          filename: file.name,
+          mimeType: file.type,
+          size: file.size,
+          folderId: null,
+          hash, // 👈 send hash to server
+        }),
+      });
+
+      // ✅ Handle 409 duplicate response
+      if (res.status === 409) {
+        const data = await res.json();
+        throw { isDuplicate: true, existingFile: data.existingFile };
+      }
+
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.error || "Upload failed");
+      }
+
+      const data = await res.json();
+
+      await fetch(data.uploadUrl, {
+        method: "PUT",
+        body: file,
+        headers: { "Content-Type": file.type },
+      });
+
+      return data;
+    },
+   onSuccess: (data) => {
+  queryClient.setQueryData(["files"], (old: any) => [
+    { ...data.file, status: "uploaded" }, // 👈 optimistically treat as uploaded
+    ...(old || []),
+  ]);
+     setTimeout(() => {
+    queryClient.invalidateQueries({ queryKey: ["files"] });
+  }, 3000);
+  }});
+
+  const getFileUrl = async (key: string) => {
+    const res = await fetch("/api/files/fetch/url", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        filename: file.name,
-        mimeType: file.type,
-        size: file.size,
-        folderId: null,
-      }),
+      body: JSON.stringify({ key }),
     });
+    const data = await res.json();
+    return data.url;
+  };
 
-    if (!res.ok) {
-      const data = await res.json();
-      throw new Error(data.error || "Upload failed");
+  const handleFile = async (file: File) => {
+    setStatus("uploading");
+    setProgress(0);
+    setErrorMsg("");
+    setDuplicateFile(null);
+
+    let interval: NodeJS.Timeout;
+
+    try {
+      interval = setInterval(() => {
+        setProgress((p) => (p < 85 ? p + 10 : p));
+      }, 150);
+
+      await uploadMutation.mutateAsync(file);
+
+      clearInterval(interval);
+      setProgress(100);
+      setStatus("success");
+    } catch (err: any) {
+      clearInterval(interval!);
+
+      // ✅ Distinguish duplicate vs generic error
+      if (err?.isDuplicate) {
+        setStatus("duplicate");
+        setDuplicateFile(err.existingFile ?? null);
+      } else {
+        setStatus("error");
+        setErrorMsg(err?.message || "Upload failed");
+      }
     }
-
-    const data = await res.json(); // gets back { uploadUrl, ... }
-
-    // ✅ Step 2: send the actual file binary → cloud storage (S3/Appwrite etc.)
-    await fetch(data.uploadUrl, {
-      method: "PUT",
-      body: file,
-      headers: { "Content-Type": file.type },
-    });
-
-    clearInterval(interval);
-    setProgress(100);
-    setUploadedFile({ name: file.name, size: file.size, url: data.url });
-    setStatus("success");
-  } catch (err: any) {
-    setStatus("error");
-    setErrorMsg(err.message || "Something went wrong");
-  }
-};
-  
+  };
 
   const onDrop = (e: DragEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -84,216 +145,75 @@ export default function FileUpload() {
     if (file) handleFile(file);
   };
 
-  const reset = () => {
-    setStatus("idle");
-    setUploadedFile(null);
-    setProgress(0);
-    setErrorMsg("");
-    if (inputRef.current) inputRef.current.value = "";
-  };
-
-  const formatSize = (bytes: number) =>
-    bytes < 1024 * 1024
-      ? `${(bytes / 1024).toFixed(1)} KB`
-      : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-
   return (
-    <div className="file-upload-wrapper">
-      {status === "idle" || status === "uploading" ? (
+    <div className="file-upload-container">
+      <div className="file-upload-wrapper">
         <div
-          className={`drop-zone ${dragging ? "dragging" : ""} ${status === "uploading" ? "uploading" : ""}`}
+          className={`drop-zone ${dragging ? "dragging" : ""}`}
+          style={{
+            minHeight: "200px",
+            border: "2px dashed #ccc",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            cursor: "pointer",
+          }}
           onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
           onDragLeave={() => setDragging(false)}
           onDrop={onDrop}
-          onClick={() => status === "idle" && inputRef.current?.click()}
+          onClick={() => inputRef.current?.click()}
         >
-          <input
-            ref={inputRef}
-            type="file"
-            className="hidden-input"
-            onChange={onInputChange}
-          />
+          <input ref={inputRef} type="file" hidden onChange={onInputChange} />
 
-          {status === "idle" ? (
-            <>
-              <div className="upload-icon">
-                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                  <polyline points="17 8 12 3 7 8" />
-                  <line x1="12" y1="3" x2="12" y2="15" />
-                </svg>
-              </div>
-              <p className="drop-title">Drop your file here</p>
-              <p className="drop-sub">or <span className="browse-link">browse</span> to choose a file</p>
-            </>
-          ) : (
-            <div className="progress-area">
-              <p className="uploading-name">Uploading...</p>
-              <div className="progress-bar-track">
-                <div className="progress-bar-fill" style={{ width: `${progress}%` }} />
-              </div>
-              <p className="progress-pct">{progress}%</p>
+          {status === "idle" && <p>Drop file or click to upload</p>}
+          {status === "uploading" && <p>Uploading... {progress}%</p>}
+          {status === "success" && <p>✅ Uploaded</p>}
+          {status === "error" && <p>❌ {errorMsg}</p>}
+
+          {/* ✅ Duplicate warning with link to existing file */}
+          {status === "duplicate" && (
+            <div onClick={(e) => e.stopPropagation()}>
+              <p>⚠️ This file already exists in this folder.</p>
+              {duplicateFile && (
+                <button
+                  onClick={async () => {
+                    const url = await getFileUrl(duplicateFile.storageUrl);
+                    window.open(url, "_blank");
+                  }}
+                >
+                  Open existing: {duplicateFile.filename}
+                </button>
+              )}
             </div>
           )}
         </div>
-      ) : status === "success" && uploadedFile ? (
-        <div className="result-card success">
-          <div className="result-icon success-icon">
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <polyline points="20 6 9 17 4 12" />
-            </svg>
-          </div>
-          <div className="result-info">
-            <p className="result-filename">{uploadedFile.name}</p>
-            <p className="result-size">{formatSize(uploadedFile.size)}</p>
-          </div>
-          <button className="reset-btn" onClick={reset}>Upload another</button>
-        </div>
-      ) : (
-        <div className="result-card error">
-          <div className="result-icon error-icon">
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <line x1="18" y1="6" x2="6" y2="18" />
-              <line x1="6" y1="6" x2="18" y2="18" />
-            </svg>
-          </div>
-          <div className="result-info">
-            <p className="result-filename">Upload failed</p>
-            <p className="result-size">{errorMsg}</p>
-          </div>
-          <button className="reset-btn" onClick={reset}>Try again</button>
-        </div>
-      )}
+      </div>
 
-      <style>{`
-        .file-upload-wrapper {
-          width: 100%;
-          max-width: 480px;
-          font-family: 'DM Sans', sans-serif;
-        }
-        .drop-zone {
-          border: 2px dashed #d1d5db;
-          border-radius: 16px;
-          padding: 48px 32px;
-          text-align: center;
-          cursor: pointer;
-          transition: border-color 0.2s, background 0.2s;
-          background: #fafafa;
-        }
-        .drop-zone:hover, .drop-zone.dragging {
-          border-color: #6366f1;
-          background: #f5f3ff;
-        }
-        .drop-zone.uploading {
-          cursor: default;
-          pointer-events: none;
-        }
-        .hidden-input { display: none; }
-        .upload-icon {
-          display: flex;
-          justify-content: center;
-          margin-bottom: 16px;
-          color: #6366f1;
-        }
-        .drop-title {
-          font-size: 1.05rem;
-          font-weight: 600;
-          color: #111827;
-          margin: 0 0 6px;
-        }
-        .drop-sub {
-          font-size: 0.875rem;
-          color: #6b7280;
-          margin: 0;
-        }
-        .browse-link {
-          color: #6366f1;
-          font-weight: 500;
-          text-decoration: underline;
-          cursor: pointer;
-        }
-        .progress-area { width: 100%; }
-        .uploading-name {
-          font-size: 0.9rem;
-          font-weight: 500;
-          color: #374151;
-          margin: 0 0 12px;
-        }
-        .progress-bar-track {
-          width: 100%;
-          height: 6px;
-          background: #e5e7eb;
-          border-radius: 999px;
-          overflow: hidden;
-        }
-        .progress-bar-fill {
-          height: 100%;
-          background: #6366f1;
-          border-radius: 999px;
-          transition: width 0.2s ease;
-        }
-        .progress-pct {
-          font-size: 0.8rem;
-          color: #6b7280;
-          margin: 8px 0 0;
-          text-align: right;
-        }
-        .result-card {
-          display: flex;
-          align-items: center;
-          gap: 16px;
-          padding: 20px 24px;
-          border-radius: 16px;
-          border: 1px solid;
-        }
-        .result-card.success {
-          background: #f0fdf4;
-          border-color: #bbf7d0;
-        }
-        .result-card.error {
-          background: #fef2f2;
-          border-color: #fecaca;
-        }
-        .result-icon {
-          flex-shrink: 0;
-          width: 48px;
-          height: 48px;
-          border-radius: 50%;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-        }
-        .success-icon { background: #dcfce7; color: #16a34a; }
-        .error-icon { background: #fee2e2; color: #dc2626; }
-        .result-info { flex: 1; min-width: 0; }
-        .result-filename {
-          font-size: 0.9rem;
-          font-weight: 600;
-          color: #111827;
-          margin: 0 0 2px;
-          white-space: nowrap;
-          overflow: hidden;
-          text-overflow: ellipsis;
-        }
-        .result-size {
-          font-size: 0.8rem;
-          color: #6b7280;
-          margin: 0;
-        }
-        .reset-btn {
-          flex-shrink: 0;
-          padding: 8px 16px;
-          border-radius: 8px;
-          border: 1px solid #d1d5db;
-          background: white;
-          font-size: 0.8rem;
-          font-weight: 500;
-          cursor: pointer;
-          color: #374151;
-          transition: background 0.15s;
-        }
-        .reset-btn:hover { background: #f3f4f6; }
-      `}</style>
+      <div className="files-section">
+        <h3>Your Files</h3>
+        {isLoading ? (
+          <p>Loading...</p>
+        ) : files.length === 0 ? (
+          <p>No files yet</p>
+        ) : (
+          files
+            .filter((f) => f.status === "uploaded")
+            .map((file) => (
+              <div key={file._id}>
+                <p>{file.filename}</p>
+                <button
+                  onClick={async () => {
+                    const url = await getFileUrl(file.storageUrl);
+                    window.open(url, "_blank");
+                  }}
+                >
+                  Open
+                </button>
+              </div>
+            ))
+        )}
+      </div>
     </div>
   );
 }

@@ -1,57 +1,44 @@
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/[...nextauth]";
 import connectDB from "@/lib/mongoose";
+import { s3, BUCKET } from "@/lib/s3";
+import { GetObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import File from "@/models/File";
+import User from "@/models/User";
 
-const s3 = new S3Client({
-  region: process.env.AWS_REGION!,
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY!,
-    secretAccessKey: process.env.AWS_SECRET_KEY!,
-  },
-});
-
-export async function POST(req: Request) {
-  try {
-    // ✅ 1. Check session
-    const session = await getServerSession(authOptions);
-    if (!session) {
-      return Response.json({ error: "Unauthorized" }, { status: 401 });
-    }
-
-    // ✅ 2. Get file key from frontend
-    const { key } = await req.json();
-
-    // ✅ 3. Connect DB
-    await connectDB();
-
-    // ✅ 4. Verify ownership (VERY IMPORTANT)
-    const file = await File.findOne({
-      storageUrl: key,
-      owner_id:session.user.id,
-    });
-
-    if (!file) {
-      return Response.json({ error: "Forbidden" }, { status: 403 });
-    }
-
-    // ✅ 5. Generate signed URL
-    const command = new GetObjectCommand({
-      Bucket: process.env.S3_BUCKET!,
-      Key: key,
-    });
-
-    const url = await getSignedUrl(s3, command, {
-      expiresIn: 60, 
-    });
-
-    // ✅ 6. Return URL
-    return Response.json({ url });
-
-  } catch (error) {
-    console.error(error);
-    return Response.json({ error: "Server error" }, { status: 500 });
+export async function POST(req: NextRequest) {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+
+  const body = await req.json();
+  const { key } = body as { key: string };
+
+  if (!key) {
+    return NextResponse.json({ error: "key is required" }, { status: 400 });
+  }
+
+  await connectDB();
+
+  // Ownership check — users can only get URLs to their own files
+  const user = await User.findOne({ email: session.user.email });
+  if (!user) {
+    return NextResponse.json({ error: "User not found" }, { status: 404 });
+  }
+
+  const file = await File.findOne({ storageUrl: key, owner_id: user._id });
+  if (!file) {
+    return NextResponse.json({ error: "Access denied" }, { status: 403 });
+  }
+
+  const url = await getSignedUrl(
+    s3,
+    new GetObjectCommand({ Bucket: BUCKET, Key: key }),
+    { expiresIn: 3600 } // 1 hour
+  );
+
+  return NextResponse.json({ url }, { status: 200 });
 }

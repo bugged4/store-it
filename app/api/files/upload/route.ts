@@ -1,69 +1,99 @@
-import { authOptions } from '@/lib/[...nextauth]';
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
-import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { getServerSession } from 'next-auth';
-import User from '@/models/User';
-import connectDB from '@/lib/mongoose';
-import File from "@/models/File"
-const s3 = new S3Client({
-  region: process.env.AWS_REGION,
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY!,
-    secretAccessKey: process.env.AWS_SECRET_KEY!,
-  },
-});
+import { NextRequest, NextResponse } from "next/server";
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/[...nextauth]";
+import connectDB from "@/lib/mongoose";
+import { s3, BUCKET } from "@/lib/s3";
+import { PutObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import File from "@/models/File";
+import User from "@/models/User";
 
-// app/api/files/upload/route.ts
-export async function POST(req: Request) {
-  const session = await getServerSession(authOptions);
-  if (!session) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+const MAX_SIZE = 10 * 1024 * 1024;
 
-  const { filename, mimeType, size, folderId, hash } = await req.json(); // 👈 accept hash
+export async function POST(req: NextRequest) {
+  try {
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
 
-  await connectDB();
+    const body = await req.json();
+    const { filename, mimeType, size, folderId = null, hash } = body;
 
-  const user = await User.findById(session.user.id);
-  if (user.storageUsed + size > user.storageLimit) {
-    return Response.json({ error: 'Storage quota exceeded' }, { status: 413 });
-  }
+    if (!filename || !mimeType || !size || !hash) {
+      return NextResponse.json(
+        { error: "Missing required fields" },
+        { status: 400 }
+      );
+    }
 
-  //  Check for duplicate by content hash (same file, same folder)
-  if (hash) {
-    const duplicate = await File.findOne({
-      owner_id: session.user.id,
+    if (size > MAX_SIZE) {
+      return NextResponse.json(
+        { error: "File too large" },
+        { status: 400 }
+      );
+    }
+
+    await connectDB();
+
+    const user = await User.findOne({ email: session.user.email });
+    if (!user) {
+      return NextResponse.json({ error: "User not found" }, { status: 404 });
+    }
+
+    if (!user.hasEnoughStorage(size)) {
+      return NextResponse.json(
+        { error: "Storage limit exceeded" },
+        { status: 413 }
+      );
+    }
+
+    const existing = await File.findOne({
       hash,
-      folders_id: folderId || null,
-      status: { $ne: 'pending' },
+      owner_id: user._id,
+      status: "uploaded",
     });
 
-    if (duplicate) {
-      return Response.json(
-        { error: 'This file already exists in this folder', existingFile: duplicate },
+    if (existing) {
+      return NextResponse.json(
+        { error: "Duplicate file", existingFile: existing },
         { status: 409 }
       );
     }
+
+    const key = `uploads/${user._id}/${Date.now()}-${filename}`;
+
+    const file = await File.create({
+      filename,
+      hash,
+      owner_email: user.email,
+      owner_id: user._id,
+      mimetype: mimeType,
+      size,
+      storageUrl: key,
+      folders_id: folderId,
+      status: "pending",
+    });
+    console.log({
+  region: process.env.AWS_REGION,
+  key: process.env.AWS_ACCESS_KEY_ID,
+  secret: process.env.AWS_SECRET_ACCESS_KEY,
+});
+
+    const uploadUrl = await getSignedUrl(
+      s3,
+      new PutObjectCommand({
+        Bucket: BUCKET,
+        Key: key,
+        ContentType: mimeType,
+        ContentLength: size,
+      }),
+      { expiresIn: 900 }
+    );
+
+    return NextResponse.json({ uploadUrl, fileId: file._id.toString(),key});
+  } catch (err) {
+    console.error(err);
+    return NextResponse.json({ error: "Server error" }, { status: 500 });
   }
-
-  const key = `${session.user.id}/${Date.now()}-${filename}`;
-
-  const filedoc = await File.create({
-    filename,
-    mimetype: mimeType,
-    size,
-    hash,              // 👈 store the hash
-    folders_id: folderId || null,
-    owner_id: session.user.id,
-    storageUrl: key,
-    status: 'pending',
-  });
-
-  const command = new PutObjectCommand({
-    Bucket: process.env.S3_BUCKET,
-    Key: key,
-    ContentType: mimeType,
-  });
-
-  const presignedUrl = await getSignedUrl(s3, command, { expiresIn: 300 });
-
-  return Response.json({ uploadUrl: presignedUrl, key, file: filedoc })
 }

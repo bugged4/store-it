@@ -26,7 +26,7 @@ export const authOptions: NextAuthOptions = {
         email: { label: 'Email', type: 'email' },
         password: { label: 'Password', type: 'password' },
       },
-      async authorize(credentials) {
+   async authorize(credentials) {
         console.log("Authorize function called");
   console.log("Credentials received:", credentials);
 
@@ -40,7 +40,6 @@ export const authOptions: NextAuthOptions = {
   console.error("Database connection error:", err);
   throw new Error("Failed to connect to the database");
 }
-
         const user = await User.findOne({
           email: credentials.email.toLowerCase().trim(),
         }).select('+password');
@@ -72,38 +71,44 @@ export const authOptions: NextAuthOptions = {
 
   // ── Callbacks ──────────────────────────────────────────────────
   callbacks: {
-    async signIn({ user, account, profile }) {
-      if (account?.provider === 'google') {
-        try {
-          await connectDB();
+  async signIn({ user, account, profile }) {
+    if (account?.provider === 'google') {
+      try {
+        await connectDB();
 
-          const email = user.email!.toLowerCase();
-          const existingUser = await User.findOne({ email });
+        const email = user.email!.toLowerCase();
+        const existingUser = await User.findOne({ email });
 
-          if (existingUser) {
-            if (existingUser.provider === 'credentials') {
-              return '/auth/login?error=EmailUsedWithPassword';
+        if (existingUser) {
+          // 🔥 LINK ACCOUNT instead of blocking
+          await User.updateOne(
+            { email },
+            {
+              $set: {
+                name: user.name,
+                image: user.image,
+                provider: 'google', // switch provider
+                providerId: profile?.sub,
+              },
             }
-            await User.updateOne(
-              { email },
-              { $set: { name: user.name, image: user.image, providerId: profile?.sub } }
-            );
-          } else {
-            await User.create({
-              email,
-              name: user.name,
-              image: user.image,
-              provider: 'google',
-              providerId: profile?.sub,
-            });
-          }
-        } catch (err) {
-          console.error('Google signIn error:', err);
-          return false;
+          );
+        } else {
+          await User.create({
+            email,
+            name: user.name,
+            image: user.image,
+            provider: 'google',
+            providerId: profile?.sub,
+          });
         }
+      } catch (err) {
+        console.error('Google signIn error:', err);
+        return false;
       }
-      return true;
-    },
+    }
+    return true;
+  },
+
 
     async jwt({ token, user, account }) {
       // ── First sign-in (any provider) ──────────────────────────
@@ -139,6 +144,7 @@ export const authOptions: NextAuthOptions = {
 
     async session({ session, token }) {
       if (token && session.user) {
+        session.user.email = token.email as string;
         session.user.id = token.id as string;
         session.user.provider = token.provider as string;
         session.user.storageused = token.storageused as number;

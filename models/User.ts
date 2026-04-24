@@ -5,7 +5,9 @@ import bcrypt from 'bcryptjs';
 const UserSchema = new mongoose.Schema({
   email: { type: String, required: true, unique: true, lowercase: true, trim: true },
   name:  { type: String, required: true, trim: true },
-  password: { type: String, required: true, select: false }, // ← add this
+  password: { type: String, required: true, select: false}, 
+  provider:     { type: String, default: 'credentials' },  
+  providerId:   { type: String },  
   storageused:  { type: Number, default: 0 },
   storagelimit: { type: Number, default: 5 * 1024 * 1024 * 1024 },
   createdAt: { type: Date, default: Date.now },

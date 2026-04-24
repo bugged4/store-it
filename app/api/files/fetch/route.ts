@@ -4,7 +4,8 @@ import connectDB from "@/lib/mongoose";
 import File from "@/models/File";
 import { NextResponse } from "next/server";
 
-export async function GET() {
+
+export async function GET(req: Request) {
   const session = await getServerSession(authOptions);
 
   if (!session) {
@@ -15,13 +16,17 @@ export async function GET() {
     await connectDB();
 
     const files = await File.find({
-      owner_id: session.user.id,
+      owner_email: session.user.email,
       status: "uploaded",
     })
-      .sort({ createdAt: -1 }) // newest uploads first
-      .lean();                  // plain JS objects, faster serialization
+      .sort({ createdAt: -1 })
+      .lean();
+
+    // ── NEW: return grouped structure if ?grouped=true ──────────────
+    
 
     return NextResponse.json(files);
+
   } catch (error) {
     console.error("Failed to fetch files:", error);
     return NextResponse.json(

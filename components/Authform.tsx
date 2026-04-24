@@ -88,14 +88,7 @@ async function onSubmit(data: FormValues) {
 
       toast.success("Account created!");
 
-      //auto login after signup
-      await signIn("credentials", {
-        email: data.email,
-        password: data.password,
-        redirect: false,
-      });
-
-      router.push("/dashboard");
+      router.push("/login")
 
     } else {
       // 🔵 LOGIN USER

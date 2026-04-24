@@ -11,12 +11,7 @@ const imgwidth1="w-[100px]"
         <section className="bg-brand p-10 ">
 
       <div className="transition-transform duration-500 hover:rotate-5 hover:scale-105">
-  <Image
-    src="/search.png"
-    alt="logo"
-    width={100}
-    height={100}
-  />
+ 
 </div>
 
       

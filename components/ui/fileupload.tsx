@@ -496,7 +496,7 @@ export default function FileUpload() {
             <p>Drop files to upload, or browse from your device.</p>
              <div style={{ marginTop: 12, display: "flex", gap: 10 }}>
     <button
-      onClick={() => router.push("/showfiles")}
+      onClick={() => router.push("/show_files")}
       style={{
         padding: "8px 14px",
         borderRadius: "8px",

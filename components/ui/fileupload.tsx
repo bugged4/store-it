@@ -1,14 +1,13 @@
 "use client";
 import { useRouter } from "next/navigation";
-
-// Files below this size use a single presigned PUT (matches upload/route MAX_SIZE)
-// Files at or above this size use multipart (init → presign parts → upload → complete)
-const SMALL_FILE_LIMIT = 10 * 1024 * 1024;  // 10MB
-const CHUNK_SIZE       = 10 * 1024 * 1024;  // 10MB per part (matches init/route CHUNK_SIZE)
-
 import { useState, useRef, useEffect, DragEvent, ChangeEvent } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 
+// ── Constants ────────────────────────────────────────────────────────────────
+const SMALL_FILE_LIMIT = 10 * 1024 * 1024;
+const CHUNK_SIZE = 10 * 1024 * 1024;
+
+// ── Types ────────────────────────────────────────────────────────────────────
 type UploadStatus = "idle" | "uploading" | "success" | "error" | "duplicate";
 
 type FileType = {
@@ -19,9 +18,28 @@ type FileType = {
   storageUrl: string;
   owner_id: string;
   status: "pending" | "uploaded";
+  folderId: string | null;
   createdAt: string;
 };
 
+type FolderType = {
+  _id: string;
+  name: string;
+  owner_id: string;
+  createdAt: string;
+};
+
+type ContextMenu = {
+  x: number;
+  y: number;
+  item: FileType | FolderType;
+  itemType: "file" | "folder";
+};
+
+type DeleteTarget = { type: "file"; item: FileType } | { type: "folder"; item: FolderType };
+type ToastMsg = { msg: string; type: "error" | "warn" | "success" };
+
+// ── Utils ────────────────────────────────────────────────────────────────────
 async function getFileHash(file: File): Promise<string> {
   const buffer = await file.arrayBuffer();
   const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
@@ -48,20 +66,35 @@ function getFileIcon(mimetype: string): string {
   return "📁";
 }
 
+// ── Component ────────────────────────────────────────────────────────────────
 export default function FileUpload() {
-    const router = useRouter();
-  const [dragging, setDragging]         = useState(false);
-  const [status, setStatus]             = useState<UploadStatus>("idle");
-  const [errorMsg, setErrorMsg]         = useState("");
-  const [progress, setProgress]         = useState(0);
-  const [duplicateFile, setDuplicateFile] = useState<FileType | null>(null);
-  const [toast, setToast]               = useState<{ msg: string; type: "error" | "warn" | "success" } | null>(null);
-
-  const inputRef   = useRef<HTMLInputElement>(null);
-  const cancelRef  = useRef(false);
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
-
+  const router = useRouter();
   const queryClient = useQueryClient();
+  const [openMenuId, setOpenMenuId] = useState<string | null>(null);
+  // Upload state
+  const [dragging, setDragging] = useState(false);
+  const [status, setStatus] = useState<UploadStatus>("idle");
+  const [errorMsg, setErrorMsg] = useState("");
+  const [progress, setProgress] = useState(0);
+  const [duplicateFile, setDuplicateFile] = useState<FileType | null>(null);
+  const [toast, setToast] = useState<ToastMsg | null>(null);
+
+  // Folder / navigation state
+  const [currentFolderId, setCurrentFolderId] = useState<string | null>(null);
+  const [newFolderName, setNewFolderName] = useState("");
+  const [showNewFolder, setShowNewFolder] = useState(false);
+
+  // Context menu & modals
+  const [ctxMenu, setCtxMenu] = useState<ContextMenu | null>(null);
+  const [moveTarget, setMoveTarget] = useState<FileType | null>(null);
+  const [shareTarget, setShareTarget] = useState<FileType | null>(null);
+  const [shareUrl, setShareUrl] = useState("");
+  const [shareCopied, setShareCopied] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
+
+  const inputRef = useRef<HTMLInputElement>(null);
+  const cancelRef = useRef(false);
+  const intervalRef = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
     if (!toast) return;
@@ -69,7 +102,19 @@ export default function FileUpload() {
     return () => clearTimeout(t);
   }, [toast]);
 
-  const { data: files = [], isLoading } = useQuery<FileType[]>({
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const close = () => setCtxMenu(null);
+    window.addEventListener("click", close);
+    return () => window.removeEventListener("click", close);
+  }, [ctxMenu]);
+  useEffect(() => {
+    const close = () => setOpenMenuId(null);
+    window.addEventListener("click", close);
+    return () => window.removeEventListener("click", close);
+  }, []);
+  // ── Queries ──────────────────────────────────────────────────────────────
+  const { data: files = [], isLoading: filesLoading } = useQuery<FileType[]>({
     queryKey: ["files"],
     queryFn: async () => {
       const res = await fetch("/api/files/fetch");
@@ -78,221 +123,224 @@ export default function FileUpload() {
     },
   });
 
-  const uploadedFiles = files.filter((f) => f.status === "uploaded");
+  const { data: folders = [], isLoading: foldersLoading } = useQuery<FolderType[]>({
+    queryKey: ["folders"],
+    queryFn: async () => {
+      const res = await fetch("/api/folders");
+      if (!res.ok) throw new Error("Failed to fetch folders");
+      return res.json();
+    },
+  });
 
-  // ── Helper: parse error responses consistently ────────────────────────────
+  const uploadedFiles = files.filter((f) => f.status === "uploaded");
+  const visibleFiles = uploadedFiles.filter((f) => f.folderId === currentFolderId);
+
   async function parseError(res: Response, fallback: string) {
     const data = await res.json().catch(() => ({}));
     return new Error(data.error || fallback);
   }
 
-  // ── Small file: single presigned PUT ─────────────────────────────────────
-  // upload/route returns { uploadUrl, fileId, key }
-  // confirm/route expects { fileId }
+  // ── Small upload ─────────────────────────────────────────────────────────
   const smallUploadMutation = useMutation({
     mutationFn: async ({ file, hash }: { file: File; hash: string }) => {
       const res = await fetch("/api/files/upload", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          filename: file.name,
-          mimeType: file.type,
-          size: file.size,
-          folderId: null,
-          hash,
-        }),
+        body: JSON.stringify({ filename: file.name, mimeType: file.type, size: file.size, folderId: currentFolderId, hash }),
       });
-
       if (cancelRef.current) throw { isCancelled: true };
-
-      if (res.status === 409) {
-        const data = await res.json();
-        throw { isDuplicate: true, existingFile: data.existingFile };
-      }
-      if (res.status === 413) throw new Error("File exceeds 10MB — use a smaller file");
+      if (res.status === 409) { const d = await res.json(); throw { isDuplicate: true, existingFile: d.existingFile }; }
+      if (res.status === 413) throw new Error("File exceeds 10 MB");
       if (res.status === 401) throw new Error("Session expired, please log in again");
-      if (res.status === 400) throw await parseError(res, "Invalid file data");
-      if (res.status === 500) throw await parseError(res, "Server error, please try again");
-      if (!res.ok)            throw await parseError(res, `Upload failed (${res.status})`);
-
-      const { uploadUrl, fileId } = (await res.json()) as {
-        uploadUrl: string;
-        fileId: string;
-        key: string;
-      };
-
+      if (!res.ok) throw await parseError(res, `Upload failed (${res.status})`);
+      const { uploadUrl, fileId } = await res.json();
       if (cancelRef.current) throw { isCancelled: true };
-
-      // PUT directly to S3
-      const putRes = await fetch(uploadUrl, {
-        method: "PUT",
-        body: file,
-        headers: { "Content-Type": file.type },
-      });
+      const putRes = await fetch(uploadUrl, { method: "PUT", body: file, headers: { "Content-Type": file.type } });
       if (!putRes.ok) throw new Error("Failed to upload file to storage");
-
       if (cancelRef.current) throw { isCancelled: true };
-
-      // Confirm — marks DB record as "uploaded" + updates quota
       const confirmRes = await fetch("/api/files/confirm", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
+        method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ fileId }),
       });
       if (!confirmRes.ok) throw new Error("Failed to confirm upload");
-
       return confirmRes.json();
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["files"] }),
   });
 
-  // ── Large file: S3 multipart ──────────────────────────────────────────────
-  // init    → POST /api/files/upload/multipart/init    { filename, mimeType, size, folderId, hash }
-  //           returns { uploadId, key, totalParts, fileId }
-  // presign → POST /api/files/upload/multipart/presign { key, uploadId, partNumbers }
-  //           returns { urls: string[] }
-  // complete→ POST /api/files/upload/multipart/complete { key, uploadId, parts, fileId }
-  //           returns { file }
-  async function multipartUpload(
-    file: File,
-    hash: string,
-    onProgress: (pct: number) => void
-  ) {
-    // 1. Init
+  // ── Multipart upload ─────────────────────────────────────────────────────
+  async function multipartUpload(file: File, hash: string, onProgress: (pct: number) => void) {
     const initRes = await fetch("/api/files/upload/multipart/init", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        filename: file.name,
-        mimeType: file.type,
-        size: file.size,
-        folderId: null,
-        hash,
-      }),
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename: file.name, mimeType: file.type, size: file.size, folderId: currentFolderId, hash }),
     });
-
     if (cancelRef.current) throw { isCancelled: true };
-
-    if (initRes.status === 409) {
-      const data = await initRes.json();
-      throw { isDuplicate: true, existingFile: data.existingFile };
-    }
-    if (initRes.status === 413) throw new Error("Storage limit exceeded");
-    if (initRes.status === 401) throw new Error("Session expired, please log in again");
+    if (initRes.status === 409) { const d = await initRes.json(); throw { isDuplicate: true, existingFile: d.existingFile }; }
     if (!initRes.ok) throw await parseError(initRes, "Failed to initialise multipart upload");
-
     const { uploadId, key, totalParts, fileId } = await initRes.json();
-
-    // 2. Get presigned URLs for every part
     const partNumbers = Array.from({ length: totalParts }, (_, i) => i + 1);
-
     const presignRes = await fetch("/api/files/upload/multipart/presign", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+      method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ key, uploadId, partNumbers }),
     });
-
     if (cancelRef.current) throw { isCancelled: true };
     if (!presignRes.ok) throw new Error("Failed to get presigned URLs");
-
-    const { urls } = (await presignRes.json()) as { urls: string[] };
-
-    // 3. Upload each chunk, tracking real progress
+    const { urls } = await presignRes.json();
     let uploadedBytes = 0;
-
-    const parts = await Promise.all(
-      urls.map(async (url, i) => {
-        if (cancelRef.current) throw { isCancelled: true };
-
-        const start = i * CHUNK_SIZE;
-        const chunk = file.slice(start, start + CHUNK_SIZE);
-
-        const res = await fetch(url, { method: "PUT", body: chunk });
-        if (!res.ok) throw new Error(`Failed to upload part ${i + 1}`);
-
-        // ETag is required by S3 to assemble the final object
-        const ETag = res.headers.get("ETag") ?? "";
-
-        uploadedBytes += chunk.size;
-        onProgress(Math.round((uploadedBytes / file.size) * 100));
-
-        return { PartNumber: i + 1, ETag };
-      })
-    );
-
+    const parts = await Promise.all(urls.map(async (url: string, i: number) => {
+      if (cancelRef.current) throw { isCancelled: true };
+      const start = i * CHUNK_SIZE;
+      const chunk = file.slice(start, start + CHUNK_SIZE);
+      const res = await fetch(url, { method: "PUT", body: chunk });
+      if (!res.ok) throw new Error(`Failed to upload part ${i + 1}`);
+      const ETag = res.headers.get("ETag") ?? "";
+      uploadedBytes += chunk.size;
+      onProgress(Math.round((uploadedBytes / file.size) * 100));
+      return { PartNumber: i + 1, ETag };
+    }));
     if (cancelRef.current) throw { isCancelled: true };
-
-    // 4. Complete — S3 assembles parts, DB record marked "uploaded"
     const completeRes = await fetch("/api/files/upload/multipart/complete", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+      method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ key, uploadId, parts, fileId }),
     });
     if (!completeRes.ok) throw new Error("Failed to complete multipart upload");
-
     queryClient.invalidateQueries({ queryKey: ["files"] });
     return completeRes.json();
   }
 
-  // ── Route to the right strategy ───────────────────────────────────────────
   async function uploadSmart(file: File, hash: string, onProgress: (pct: number) => void) {
-    if (file.size < SMALL_FILE_LIMIT) {
-      return smallUploadMutation.mutateAsync({ file, hash });
-    }
-    return multipartUpload(file, hash, onProgress);
+    return file.size < SMALL_FILE_LIMIT
+      ? smallUploadMutation.mutateAsync({ file, hash })
+      : multipartUpload(file, hash, onProgress);
   }
 
-  // ── fetch/url/route expects { key }, returns { url } ─────────────────────
   const getFileUrl = async (key: string): Promise<string> => {
     const res = await fetch("/api/files/fetch/url", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+      method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ key }),
     });
     if (!res.ok) throw new Error("Failed to get file URL");
     return (await res.json()).url;
   };
 
+  // ── File actions ─────────────────────────────────────────────────────────
+  const downloadFile = async (file: FileType) => {
+    try {
+      const url = await getFileUrl(file.storageUrl);
+      const res = await fetch(url);
+      const blob = await res.blob();
+      const blobUrl = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = blobUrl; a.download = file.filename; a.click();
+      window.URL.revokeObjectURL(blobUrl);
+    } catch { setToast({ msg: "Download failed.", type: "error" }); }
+  };
+
+  const downloadFolder = async (folder: FolderType) => {
+    try {
+      const res = await fetch(`/api/folders/${folder._id}/download`);
+      if (!res.ok) throw new Error("Failed");
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = `${folder.name}.zip`; a.click();
+      window.URL.revokeObjectURL(url);
+      setToast({ msg: `"${folder.name}" downloaded as ZIP.`, type: "success" });
+    } catch { setToast({ msg: "Folder download failed.", type: "error" }); }
+  };
+
+  const openShareModal = async (file: FileType) => {
+    setShareTarget(file); setShareUrl(""); setShareCopied(false);
+    try {
+      const res = await fetch(`/api/files/${file._id}/share`, { method: "POST" });
+      if (!res.ok) throw new Error("Failed");
+      const { shareUrl: url } = await res.json();
+      setShareUrl(url);
+    } catch {
+      setToast({ msg: "Could not generate share link.", type: "error" });
+      setShareTarget(null);
+    }
+  };
+
+  const copyShareUrl = () => {
+    if (!shareUrl) return;
+    navigator.clipboard.writeText(shareUrl);
+    setShareCopied(true);
+    setTimeout(() => setShareCopied(false), 2500);
+  };
+
+  const moveFile = async (file: FileType, targetFolderId: string | null) => {
+    try {
+      const res = await fetch(`/api/files/${file._id}`, {
+        method: "PATCH", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ folderId: targetFolderId }),
+      });
+      if (!res.ok) throw new Error("Failed");
+      queryClient.invalidateQueries({ queryKey: ["files"] });
+      setMoveTarget(null);
+      setToast({ msg: `Moved to ${targetFolderId ? folders.find(f => f._id === targetFolderId)?.name : "root"}.`, type: "success" });
+    } catch { setToast({ msg: "Move failed.", type: "error" }); }
+  };
+
+  const confirmDelete = async () => {
+    if (!deleteTarget) return;
+    try {
+      if (deleteTarget.type === "file") {
+        const res = await fetch(`/api/files/${deleteTarget.item._id}`, { method: "DELETE" });
+        if (!res.ok) throw new Error("Failed");
+        queryClient.invalidateQueries({ queryKey: ["files"] });
+        setToast({ msg: `"${(deleteTarget.item as FileType).filename}" deleted.`, type: "success" });
+      } else {
+        const res = await fetch(`/api/folders/${deleteTarget.item._id}`, { method: "DELETE" });
+        if (!res.ok) throw new Error("Failed");
+        queryClient.invalidateQueries({ queryKey: ["folders"] });
+        queryClient.invalidateQueries({ queryKey: ["files"] });
+        if (currentFolderId === deleteTarget.item._id) setCurrentFolderId(null);
+        setToast({ msg: `"${deleteTarget.item.name}" deleted.`, type: "success" });
+      }
+    } catch { setToast({ msg: "Delete failed.", type: "error" }); }
+    setDeleteTarget(null);
+  };
+
+  const createFolder = async () => {
+    const name = newFolderName.trim();
+    if (!name) return;
+    try {
+      const res = await fetch("/api/folders", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+      if (!res.ok) throw new Error("Failed");
+      queryClient.invalidateQueries({ queryKey: ["folders"] });
+      setNewFolderName(""); setShowNewFolder(false);
+      setToast({ msg: `Folder "${name}" created.`, type: "success" });
+    } catch { setToast({ msg: "Could not create folder.", type: "error" }); }
+  };
+
+  // ── Upload flow ──────────────────────────────────────────────────────────
   const handleCancel = () => {
     cancelRef.current = true;
     if (intervalRef.current) clearInterval(intervalRef.current);
-    setStatus("idle");
-    setProgress(0);
+    setStatus("idle"); setProgress(0);
     setToast({ msg: "Upload cancelled.", type: "warn" });
   };
 
   const handleFile = async (file: File) => {
-    setStatus("uploading");
-    setProgress(0);
-    setErrorMsg("");
-    setDuplicateFile(null);
+    setStatus("uploading"); setProgress(0);
+    setErrorMsg(""); setDuplicateFile(null);
     cancelRef.current = false;
-
-    // For small files: fake ticker (no real progress from a single PUT)
-    // For large files: real progress via onProgress callback; ticker is stopped on first callback
     if (file.size < SMALL_FILE_LIMIT) {
-      intervalRef.current = setInterval(() => {
-        setProgress((p) => (p < 85 ? p + 8 : p));
-      }, 150);
+      intervalRef.current = setInterval(() => setProgress((p) => (p < 85 ? p + 8 : p)), 150);
     }
-
     try {
       const hash = await getFileHash(file);
-
       await uploadSmart(file, hash, (pct) => {
-        // Switch from fake ticker to real progress (multipart only)
-        if (intervalRef.current) {
-          clearInterval(intervalRef.current);
-          intervalRef.current = null;
-        }
+        if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
         setProgress(pct);
       });
-
       if (intervalRef.current) clearInterval(intervalRef.current);
-
       if (!cancelRef.current) {
-        setProgress(100);
-        setStatus("success");
+        setProgress(100); setStatus("success");
         setToast({ msg: `"${file.name}" uploaded successfully!`, type: "success" });
         setTimeout(() => setStatus("idle"), 3000);
       }
@@ -300,20 +348,17 @@ export default function FileUpload() {
       if (intervalRef.current) clearInterval(intervalRef.current);
       if (err?.isCancelled) return;
       if (err?.isDuplicate) {
-        setStatus("duplicate");
-        setDuplicateFile(err.existingFile ?? null);
+        setStatus("duplicate"); setDuplicateFile(err.existingFile ?? null);
         setToast({ msg: "This file already exists in your storage.", type: "warn" });
       } else {
-        setStatus("error");
-        setErrorMsg(err?.message || "Upload failed");
+        setStatus("error"); setErrorMsg(err?.message || "Upload failed");
         setToast({ msg: err?.message || "Upload failed.", type: "error" });
       }
     }
   };
 
   const onDrop = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    setDragging(false);
+    e.preventDefault(); setDragging(false);
     const file = e.dataTransfer.files?.[0];
     if (file) handleFile(file);
   };
@@ -324,6 +369,14 @@ export default function FileUpload() {
     e.target.value = "";
   };
 
+  const openCtx = (e: React.MouseEvent, item: FileType | FolderType, itemType: "file" | "folder") => {
+    e.preventDefault(); e.stopPropagation();
+    setCtxMenu({ x: e.clientX, y: e.clientY, item, itemType });
+  };
+
+  const currentFolder = folders.find((f) => f._id === currentFolderId);
+
+  // ── Render ───────────────────────────────────────────────────────────────
   return (
     <>
       <style>{`
@@ -333,30 +386,106 @@ export default function FileUpload() {
         .fu-root {
           --bg: #0d0f14; --surface: #13161e; --surface2: #1a1e28;
           --border: #252a38; --border-hover: #353c52;
-          --accent: #6c8eff; --accent-glow: rgba(108,142,255,0.18); --accent2: #a78bfa;
+          --accent: #6c8eff; --accent-glow: rgba(108,142,255,0.15); --accent2: #a78bfa;
           --success: #34d399; --warn: #fbbf24; --error: #f87171;
           --text: #e8eaf0; --text-muted: #6b7280; --text-dim: #9ca3af;
+          --danger: #f87171; --folder-color: #fbbf24;
           font-family: 'DM Sans', sans-serif;
           background: var(--bg); min-height: 100vh; padding: 48px 24px; color: var(--text);
         }
-        .fu-page { max-width: 680px; margin: 0 auto; }
-        .fu-header { margin-bottom: 36px; }
-        .fu-header h1 {
-          font-family: 'Syne', sans-serif; font-size: 2rem; font-weight: 800;
+
+        /* ── Top nav bar ── */
+        .fu-topbar {
+          max-width: 900px; margin: 0 auto 28px;
+          display: flex; align-items: center; justify-content: space-between;
+        }
+        .fu-topbar-brand {
+          font-family: 'Syne', sans-serif; font-size: 1.5rem; font-weight: 800;
           letter-spacing: -0.03em;
           background: linear-gradient(135deg, #e8eaf0 0%, #6c8eff 100%);
-          -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-          background-clip: text; margin-bottom: 6px;
+          -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
         }
-        .fu-header p { color: var(--text-muted); font-size: 0.9rem; font-weight: 300; }
+        .fu-topbar-actions { display: flex; gap: 8px; }
+        .fu-topbar-btn {
+          display: flex; align-items: center; gap: 6px;
+          padding: 7px 14px; border-radius: 9px;
+          font-family: 'DM Sans', sans-serif; font-size: 0.8rem; font-weight: 500;
+          cursor: pointer; border: 1px solid var(--border);
+          background: var(--surface2); color: var(--text-dim); transition: all 0.15s;
+        }
+        .fu-topbar-btn:hover { border-color: var(--border-hover); color: var(--text); }
+        .fu-topbar-btn.accent { border-color: rgba(108,142,255,0.3); color: var(--accent); background: var(--accent-glow); }
+        .fu-topbar-btn.accent:hover { background: rgba(108,142,255,0.25); }
 
+        /* ── Folder tabs ── */
+        .fu-tabs-wrap {
+          max-width: 900px; margin: 0 auto 20px;
+          display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+        }
+        .fu-tab {
+          display: flex; align-items: center; gap: 6px;
+          padding: 6px 14px; border-radius: 99px; cursor: pointer;
+          border: 1px solid var(--border); background: none; color: var(--text-muted);
+          font-family: 'DM Sans', sans-serif; font-size: 0.8rem; font-weight: 500;
+          transition: all 0.15s; white-space: nowrap;
+        }
+        .fu-tab:hover { border-color: var(--border-hover); color: var(--text); background: var(--surface2); }
+        .fu-tab.active { background: var(--accent-glow); border-color: rgba(108,142,255,0.3); color: var(--accent); }
+        .fu-tab-count {
+          background: var(--surface2); border: 1px solid var(--border);
+          color: var(--text-muted); font-size: 0.68rem;
+          padding: 1px 7px; border-radius: 99px; min-width: 20px; text-align: center;
+        }
+        .fu-tab.active .fu-tab-count { background: rgba(108,142,255,0.15); border-color: rgba(108,142,255,0.2); color: var(--accent); }
+        .fu-tab-new {
+          display: flex; align-items: center; gap: 5px;
+          padding: 6px 12px; border-radius: 99px;
+          border: 1px dashed var(--border); background: none; color: var(--text-muted);
+          font-family: 'DM Sans', sans-serif; font-size: 0.78rem; cursor: pointer;
+          transition: all 0.15s;
+        }
+        .fu-tab-new:hover { border-color: var(--accent); color: var(--accent); }
+        .fu-new-folder-inline {
+          display: flex; align-items: center; gap: 6px;
+        }
+        .fu-new-folder-input-inline {
+          background: var(--surface2); border: 1px solid var(--accent);
+          border-radius: 99px; padding: 5px 14px; color: var(--text);
+          font-family: 'DM Sans', sans-serif; font-size: 0.8rem; outline: none; width: 160px;
+        }
+        .fu-new-folder-input-inline::placeholder { color: var(--text-muted); }
+        .fu-btn-pill {
+          padding: 5px 12px; border-radius: 99px;
+          font-family: 'DM Sans', sans-serif; font-size: 0.75rem; font-weight: 500;
+          cursor: pointer; border: 1px solid var(--border);
+          background: var(--surface2); color: var(--text-dim); transition: all 0.15s;
+        }
+        .fu-btn-pill.accent { background: var(--accent-glow); border-color: rgba(108,142,255,0.3); color: var(--accent); }
+        .fu-btn-pill.accent:hover { background: rgba(108,142,255,0.25); }
+
+        /* ── Main content ── */
+        .fu-content { max-width: 900px; margin: 0 auto; display: flex; flex-direction: column; gap: 24px; }
+
+        /* Header */
+        .fu-header-sub { color: var(--text-muted); font-size: 0.85rem; font-weight: 300; margin-top: 4px; }
+        .fu-header-actions { display: flex; gap: 8px; margin-top: 12px; }
+        .fu-action-btn {
+          display: flex; align-items: center; gap: 6px;
+          padding: 7px 13px; border-radius: 8px; font-family: 'DM Sans', sans-serif;
+          font-size: 0.78rem; font-weight: 500; cursor: pointer;
+          border: 1px solid var(--border); background: var(--surface2); color: var(--text-dim);
+          transition: all 0.15s;
+        }
+        .fu-action-btn:hover { border-color: var(--border-hover); color: var(--text); }
+
+        /* ── Drop zone ── */
         .fu-dropzone {
           background: var(--surface); border: 1.5px dashed var(--border);
-          border-radius: 16px; padding: 48px 32px;
+          border-radius: 16px; padding: 40px 32px;
           display: flex; flex-direction: column; align-items: center;
           justify-content: center; gap: 12px; cursor: pointer;
           transition: all 0.2s ease; position: relative; overflow: hidden;
-          min-height: 220px; text-align: center;
+          min-height: 180px; text-align: center;
         }
         .fu-dropzone::before {
           content: ''; position: absolute; inset: 0;
@@ -364,18 +493,16 @@ export default function FileUpload() {
           opacity: 0; transition: opacity 0.3s;
         }
         .fu-dropzone:hover::before, .fu-dropzone.dragging::before { opacity: 1; }
-        .fu-dropzone:hover, .fu-dropzone.dragging {
-          border-color: var(--accent); border-style: solid; transform: translateY(-1px);
-        }
+        .fu-dropzone:hover, .fu-dropzone.dragging { border-color: var(--accent); border-style: solid; transform: translateY(-1px); }
         .fu-dropzone-icon {
-          width: 56px; height: 56px; background: var(--surface2);
-          border: 1px solid var(--border); border-radius: 14px;
+          width: 48px; height: 48px; background: var(--surface2);
+          border: 1px solid var(--border); border-radius: 12px;
           display: flex; align-items: center; justify-content: center;
-          font-size: 24px; margin-bottom: 4px; transition: transform 0.2s;
+          font-size: 22px; margin-bottom: 2px; transition: transform 0.2s;
         }
         .fu-dropzone:hover .fu-dropzone-icon { transform: scale(1.08); }
-        .fu-dropzone-title { font-family: 'Syne', sans-serif; font-size: 1rem; font-weight: 600; color: var(--text); }
-        .fu-dropzone-sub { font-size: 0.8rem; color: var(--text-muted); }
+        .fu-dropzone-title { font-family: 'Syne', sans-serif; font-size: 0.95rem; font-weight: 600; color: var(--text); }
+        .fu-dropzone-sub { font-size: 0.78rem; color: var(--text-muted); }
         .fu-dropzone-sub span { color: var(--accent); font-weight: 500; }
 
         .fu-progress-wrap { width: 100%; display: flex; flex-direction: column; gap: 10px; }
@@ -387,35 +514,24 @@ export default function FileUpload() {
           height: 100%;
           background: linear-gradient(90deg, var(--accent) 0%, var(--accent2) 100%);
           border-radius: 99px; transition: width 0.15s ease;
-          box-shadow: 0 0 8px var(--accent-glow);
         }
         .fu-cancel-btn {
-          align-self: center; background: transparent;
-          border: 1px solid var(--border); color: var(--text-muted);
-          font-family: 'DM Sans', sans-serif; font-size: 0.78rem;
-          padding: 5px 14px; border-radius: 8px; cursor: pointer; transition: all 0.15s;
+          align-self: center; background: transparent; border: 1px solid var(--border);
+          color: var(--text-muted); font-family: 'DM Sans', sans-serif;
+          font-size: 0.78rem; padding: 5px 14px; border-radius: 8px; cursor: pointer; transition: all 0.15s;
         }
         .fu-cancel-btn:hover { border-color: var(--error); color: var(--error); }
-
         .fu-status { display: flex; align-items: center; gap: 8px; font-size: 0.88rem; font-weight: 500; }
         .fu-status.success { color: var(--success); }
-        .fu-status.error { color: var(--error); }
-        .fu-status-dot {
-          width: 8px; height: 8px; border-radius: 50%;
-          background: currentColor; animation: pulse 1.2s infinite;
-        }
-        @keyframes pulse {
-          0%, 100% { opacity: 1; transform: scale(1); }
-          50% { opacity: 0.5; transform: scale(1.3); }
-        }
-
+        .fu-status.error   { color: var(--error); }
+        .fu-status-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; animation: pulse 1.2s infinite; }
+        @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.5;transform:scale(1.3)} }
         .fu-duplicate {
           background: rgba(251,191,36,0.07); border: 1px solid rgba(251,191,36,0.25);
           border-radius: 10px; padding: 14px 16px;
           display: flex; flex-direction: column; gap: 10px; width: 100%; text-align: left;
         }
-        .fu-duplicate-title { font-size: 0.85rem; font-weight: 600; color: var(--warn); display: flex; align-items: center; gap: 6px; }
-        .fu-duplicate-sub { font-size: 0.78rem; color: var(--text-muted); }
+        .fu-duplicate-title { font-size: 0.85rem; font-weight: 600; color: var(--warn); }
         .fu-dup-open-btn {
           background: rgba(251,191,36,0.1); border: 1px solid rgba(251,191,36,0.3);
           color: var(--warn); font-family: 'DM Sans', sans-serif;
@@ -424,93 +540,237 @@ export default function FileUpload() {
         }
         .fu-dup-open-btn:hover { background: rgba(251,191,36,0.2); }
 
-        .fu-files { margin-top: 36px; }
-        .fu-files-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
-        .fu-files-title { font-family: 'Syne', sans-serif; font-size: 1rem; font-weight: 700; color: var(--text); }
-        .fu-files-count {
-          font-size: 0.75rem; background: var(--surface2);
-          border: 1px solid var(--border); color: var(--text-muted);
-          padding: 2px 10px; border-radius: 99px;
+        /* ── Folder grid ── */
+        .fu-section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+        .fu-section-title { font-family: 'Syne', sans-serif; font-size: 0.9rem; font-weight: 700; color: var(--text); }
+        .fu-section-count {
+          font-size: 0.72rem; background: var(--surface2); border: 1px solid var(--border);
+          color: var(--text-muted); padding: 2px 10px; border-radius: 99px;
         }
+        .fu-folder-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; margin-bottom: 16px; }
+        .fu-folder-card {
+          background: var(--surface); border: 1px solid var(--border);
+          border-radius: 12px; padding: 16px 14px;
+          display: flex; flex-direction: column; gap: 8px;
+          cursor: pointer; transition: all 0.15s; position: relative;
+        }
+        .fu-folder-card:hover { border-color: rgba(251,191,36,0.35); transform: translateY(-2px); background: rgba(251,191,36,0.04); }
+        .fu-folder-icon { font-size: 26px; }
+        .fu-folder-name { font-size: 0.8rem; font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .fu-folder-count { font-size: 0.68rem; color: var(--text-muted); }
+        .fu-folder-card-opts {
+          position: absolute; top: 8px; right: 8px;
+          background: none; border: none; color: var(--text-muted);
+          cursor: pointer; font-size: 13px; padding: 2px 5px; border-radius: 5px;
+          opacity: 0; transition: opacity 0.15s;
+        }
+        .fu-folder-card:hover .fu-folder-card-opts { opacity: 1; }
+
+        /* ── File list ── */
         .fu-file-card {
           background: var(--surface); border: 1px solid var(--border);
-          border-radius: 12px; padding: 14px 16px;
-          display: flex; align-items: center; gap: 14px;
-          margin-bottom: 8px; transition: all 0.15s;
+          border-radius: 12px; padding: 12px 14px;
+          display: flex; align-items: center; gap: 12px;
+          margin-bottom: 7px; transition: all 0.15s;
         }
-        .fu-file-card:hover { border-color: var(--border-hover); transform: translateX(3px); }
+        .fu-file-card:hover { border-color: var(--border-hover); transform: translateX(2px); }
         .fu-file-icon {
-          font-size: 22px; flex-shrink: 0; width: 40px; height: 40px;
-          background: var(--surface2); border-radius: 10px;
+          font-size: 20px; flex-shrink: 0; width: 38px; height: 38px;
+          background: var(--surface2); border-radius: 9px;
           display: flex; align-items: center; justify-content: center;
         }
         .fu-file-info { flex: 1; overflow: hidden; }
-        .fu-file-name { font-size: 0.875rem; font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .fu-file-meta { font-size: 0.72rem; color: var(--text-muted); margin-top: 2px; }
-        .fu-file-open {
+        .fu-file-name { font-size: 0.85rem; font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .fu-file-meta { font-size: 0.7rem; color: var(--text-muted); margin-top: 2px; }
+        .fu-file-actions { display: flex; align-items: center; gap: 5px; flex-shrink: 0; }
+        .fu-icon-btn {
           background: var(--surface2); border: 1px solid var(--border);
-          color: var(--accent); font-family: 'DM Sans', sans-serif;
-          font-size: 0.75rem; font-weight: 500; padding: 6px 13px;
-          border-radius: 8px; cursor: pointer; transition: all 0.15s;
-          white-space: nowrap; flex-shrink: 0;
+          color: var(--text-muted); font-size: 0.72rem; font-weight: 500;
+          padding: 5px 10px; border-radius: 7px; cursor: pointer; transition: all 0.15s;
+          white-space: nowrap;
         }
-        .fu-file-open:hover { background: var(--accent-glow); border-color: var(--accent); }
+        .fu-icon-btn:hover { background: var(--surface); border-color: var(--border-hover); color: var(--text); }
+        .fu-icon-btn.open  { color: var(--accent); border-color: rgba(108,142,255,0.25); }
+        .fu-icon-btn.open:hover  { background: var(--accent-glow); }
+        .fu-icon-btn.share { color: var(--success); border-color: rgba(52,211,153,0.25); }
+        .fu-icon-btn.share:hover { background: rgba(52,211,153,0.1); }
+        .fu-icon-btn.danger:hover { color: var(--error); border-color: rgba(248,113,113,0.3); background: rgba(248,113,113,0.08); }
 
-        .fu-empty { text-align: center; padding: 40px 0; color: var(--text-muted); font-size: 0.85rem; }
-        .fu-empty-icon { font-size: 2rem; margin-bottom: 10px; opacity: 0.4; }
+        /* ── Context menu ── */
+        .fu-ctx {
+          position: fixed; background: var(--surface2); border: 1px solid var(--border);
+          border-radius: 12px; padding: 6px; min-width: 170px; z-index: 1000;
+          box-shadow: 0 12px 40px rgba(0,0,0,0.5); animation: ctxIn 0.12s ease;
+        }
+        @keyframes ctxIn { from{opacity:0;transform:scale(0.95)} to{opacity:1;transform:scale(1)} }
+        .fu-ctx-item {
+          display: flex; align-items: center; gap: 8px;
+          padding: 8px 12px; border-radius: 8px; cursor: pointer;
+          font-size: 0.82rem; color: var(--text-dim); transition: all 0.1s; border: none;
+          background: none; width: 100%; text-align: left; font-family: 'DM Sans', sans-serif;
+        }
+        .fu-ctx-item:hover { background: var(--surface); color: var(--text); }
+        .fu-ctx-item.danger:hover { color: var(--error); background: rgba(248,113,113,0.08); }
+        .fu-ctx-sep { height: 1px; background: var(--border); margin: 4px 0; }
 
+        /* ── Modals ── */
+        .fu-overlay {
+          position: fixed; inset: 0; background: rgba(0,0,0,0.65);
+          display: flex; align-items: center; justify-content: center; z-index: 500;
+          animation: fadeIn 0.15s ease;
+        }
+        @keyframes fadeIn { from{opacity:0} to{opacity:1} }
+        .fu-modal {
+          background: var(--surface); border: 1px solid var(--border);
+          border-radius: 18px; padding: 28px; width: 100%; max-width: 400px;
+          animation: slideUp 0.2s ease;
+        }
+        @keyframes slideUp { from{opacity:0;transform:translateY(16px)} to{opacity:1;transform:translateY(0)} }
+        .fu-modal-title { font-family: 'Syne', sans-serif; font-size: 1.05rem; font-weight: 700; color: var(--text); margin-bottom: 6px; }
+        .fu-modal-sub { font-size: 0.82rem; color: var(--text-muted); margin-bottom: 20px; }
+        .fu-modal-actions { display: flex; gap: 8px; margin-top: 20px; }
+        .fu-modal-btn {
+          flex: 1; padding: 9px; border-radius: 9px;
+          font-family: 'DM Sans', sans-serif; font-size: 0.83rem; font-weight: 500; cursor: pointer; transition: all 0.15s;
+        }
+        .fu-modal-btn.secondary { background: var(--surface2); border: 1px solid var(--border); color: var(--text-dim); }
+        .fu-modal-btn.secondary:hover { color: var(--text); border-color: var(--border-hover); }
+        .fu-modal-btn.primary { background: var(--accent-glow); border: 1px solid rgba(108,142,255,0.35); color: var(--accent); }
+        .fu-modal-btn.primary:hover { background: rgba(108,142,255,0.25); }
+        .fu-modal-btn.danger { background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.3); color: var(--error); }
+        .fu-modal-btn.danger:hover { background: rgba(248,113,113,0.18); }
+        .fu-share-url-wrap {
+          display: flex; gap: 6px; background: var(--surface2); border: 1px solid var(--border);
+          border-radius: 10px; padding: 10px 12px;
+        }
+        .fu-share-url {
+          flex: 1; font-size: 0.78rem; color: var(--text-dim);
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+          background: none; border: none; outline: none; font-family: 'DM Sans', sans-serif; cursor: default;
+        }
+        .fu-copy-btn {
+          background: var(--accent-glow); border: 1px solid rgba(108,142,255,0.3);
+          color: var(--accent); font-size: 0.75rem; font-weight: 500;
+          padding: 4px 10px; border-radius: 7px; cursor: pointer; flex-shrink: 0;
+          font-family: 'DM Sans', sans-serif; transition: all 0.15s;
+        }
+        .fu-copy-btn.copied { background: rgba(52,211,153,0.15); border-color: rgba(52,211,153,0.35); color: var(--success); }
+        .fu-folder-picker { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; }
+        .fu-picker-item {
+          display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+          border-radius: 9px; cursor: pointer; border: 1px solid transparent;
+          font-size: 0.83rem; color: var(--text-dim); background: none; text-align: left;
+          font-family: 'DM Sans', sans-serif; width: 100%; transition: all 0.12s;
+        }
+        .fu-picker-item:hover { background: var(--surface2); border-color: var(--border); color: var(--text); }
+        .fu-picker-item.active { background: var(--accent-glow); border-color: rgba(108,142,255,0.25); color: var(--accent); }
+
+        /* ── Toast ── */
         .fu-toast {
           position: fixed; bottom: 28px; right: 28px;
           background: var(--surface2); border: 1px solid var(--border);
-          border-radius: 12px; padding: 12px 18px;
-          font-size: 0.82rem; font-weight: 500;
+          border-radius: 12px; padding: 12px 18px; font-size: 0.82rem; font-weight: 500;
           display: flex; align-items: center; gap: 10px;
-          box-shadow: 0 8px 32px rgba(0,0,0,0.4);
-          animation: slideUp 0.25s ease; z-index: 999; max-width: 320px;
+          box-shadow: 0 8px 32px rgba(0,0,0,0.4); animation: slideUp 0.25s ease; z-index: 999; max-width: 320px;
         }
         .fu-toast.success { border-color: rgba(52,211,153,0.3); color: var(--success); }
         .fu-toast.warn    { border-color: rgba(251,191,36,0.3);  color: var(--warn); }
         .fu-toast.error   { border-color: rgba(248,113,113,0.3); color: var(--error); }
-        @keyframes slideUp {
-          from { opacity: 0; transform: translateY(12px); }
-          to   { opacity: 1; transform: translateY(0); }
-        }
 
         .fu-skeleton {
-          height: 64px;
+          height: 60px;
           background: linear-gradient(90deg, var(--surface) 25%, var(--surface2) 50%, var(--surface) 75%);
           background-size: 200% 100%; animation: shimmer 1.4s infinite;
-          border-radius: 12px; margin-bottom: 8px;
+          border-radius: 12px; margin-bottom: 7px;
         }
-        @keyframes shimmer {
-          0%   { background-position: 200% 0; }
-          100% { background-position: -200% 0; }
-        }
+        @keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+        .fu-empty { text-align: center; padding: 40px 0; color: var(--text-muted); font-size: 0.85rem; }
+        .fu-empty-icon { font-size: 2rem; margin-bottom: 10px; opacity: 0.4; }
       `}</style>
 
       <div className="fu-root">
-        <div className="fu-page">
 
-          <div className="fu-header">
-            <h1>Your Storage</h1>
-            <p>Drop files to upload, or browse from your device.</p>
-             <div style={{ marginTop: 12, display: "flex", gap: 10 }}>
-    <button
-      onClick={() => router.push("/show_files")}
-      style={{
-        padding: "8px 14px",
-        borderRadius: "8px",
-        border: "1px solid #252a38",
-        background: "#1a1e28",
-        color: "#6c8eff",
-        cursor: "pointer",
-      }}
-    >
-      📂 View All Files
-    </button>
-  </div>
+        {/* ── Top nav ── */}
+        <div className="fu-topbar">
+          <div className="fu-topbar-brand">Storage</div>
+          <div className="fu-topbar-actions">
+            <button className="fu-topbar-btn accent" onClick={() => router.push("/sidebar")}>
+              🗂 Browse by type
+            </button>
+          </div>
+        </div>
+
+        {/* ── Folder tabs ── */}
+        <div className="fu-tabs-wrap">
+          <button
+            className={`fu-tab ${currentFolderId === null ? "active" : ""}`}
+            onClick={() => setCurrentFolderId(null)}
+          >
+            🏠 All files
+            <span className="fu-tab-count">{uploadedFiles.filter(f => f.folderId === null).length}</span>
+          </button>
+
+          {foldersLoading ? (
+            <span style={{ fontSize: "0.78rem", color: "var(--text-muted)", padding: "0 8px" }}>Loading…</span>
+          ) : (
+            folders.map((folder) => (
+              <button
+                key={folder._id}
+                className={`fu-tab ${currentFolderId === folder._id ? "active" : ""}`}
+                onClick={() => setCurrentFolderId(folder._id)}
+                onContextMenu={(e) => openCtx(e, folder, "folder")}
+              >
+                📁 {folder.name}
+                <span className="fu-tab-count">{uploadedFiles.filter(f => f.folderId === folder._id).length}</span>
+              </button>
+            ))
+          )}
+
+          {showNewFolder ? (
+            <div className="fu-new-folder-inline">
+              <input
+                className="fu-new-folder-input-inline"
+                placeholder="Folder name…"
+                value={newFolderName}
+                onChange={(e) => setNewFolderName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") createFolder(); if (e.key === "Escape") setShowNewFolder(false); }}
+                autoFocus
+              />
+              <button className="fu-btn-pill" onClick={() => setShowNewFolder(false)}>✕</button>
+              <button className="fu-btn-pill accent" onClick={createFolder}>Create</button>
+            </div>
+          ) : (
+            <button className="fu-tab-new" onClick={() => setShowNewFolder(true)}>+ New folder</button>
+          )}
+        </div>
+
+        {/* ── Main content ── */}
+        <div className="fu-content">
+
+          {/* Header */}
+          <div>
+            <div style={{ color: "var(--text-muted)", fontSize: "0.85rem", fontWeight: 300 }}>
+              {currentFolder
+                ? `${visibleFiles.length} file${visibleFiles.length !== 1 ? "s" : ""} in "${currentFolder.name}"`
+                : "Drop files to upload, or browse from your device."}
+            </div>
+            {currentFolder && (
+              <div className="fu-header-actions">
+                <button className="fu-action-btn" onClick={() => downloadFolder(currentFolder)}>
+                  ⬇ Download folder
+                </button>
+                <button
+                  className="fu-action-btn"
+                  style={{ color: "var(--error)", borderColor: "rgba(248,113,113,0.25)" }}
+                  onClick={() => setDeleteTarget({ type: "folder", item: currentFolder })}
+                >
+                  🗑 Delete folder
+                </button>
+              </div>
+            )}
           </div>
 
+          {/* Drop zone */}
           <div
             className={`fu-dropzone ${dragging ? "dragging" : ""}`}
             onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
@@ -523,106 +783,158 @@ export default function FileUpload() {
             {status === "idle" && (
               <>
                 <div className="fu-dropzone-icon">☁️</div>
-                <div className="fu-dropzone-title">Drop your file here</div>
+                <div className="fu-dropzone-title">
+                  Drop your file here{currentFolder ? ` into "${currentFolder.name}"` : ""}
+                </div>
                 <div className="fu-dropzone-sub">
-                  or <span>browse</span> to choose · files under 10MB upload instantly, larger files use multipart
+                  or <span>browse</span> · under 10 MB uploads instantly, larger files use multipart
                 </div>
               </>
             )}
-
             {status === "uploading" && (
               <div className="fu-progress-wrap" onClick={(e) => e.stopPropagation()}>
                 <div className="fu-progress-row">
                   <span className="fu-progress-label">Uploading…</span>
                   <span className="fu-progress-pct">{progress}%</span>
                 </div>
-                <div className="fu-bar-bg">
-                  <div className="fu-bar-fill" style={{ width: `${progress}%` }} />
-                </div>
+                <div className="fu-bar-bg"><div className="fu-bar-fill" style={{ width: `${progress}%` }} /></div>
                 <button className="fu-cancel-btn" onClick={handleCancel}>✕ Cancel</button>
               </div>
             )}
-
             {status === "success" && (
-              <div className="fu-status success">
-                <div className="fu-status-dot" />
-                File uploaded successfully
-              </div>
+              <div className="fu-status success"><div className="fu-status-dot" /> File uploaded successfully</div>
             )}
-
             {status === "error" && (
               <>
                 <div className="fu-status error">✕ {errorMsg || "Upload failed"}</div>
                 <div className="fu-dropzone-sub" style={{ marginTop: 4 }}>Click to try again</div>
               </>
             )}
-
-            {status === "duplicate" && (
+            {status === "duplicate" && duplicateFile && (
               <div className="fu-duplicate" onClick={(e) => e.stopPropagation()}>
                 <div className="fu-duplicate-title">⚠ Duplicate file detected</div>
-                <div className="fu-duplicate-sub">
-                  This file already exists in your storage.
-                  {duplicateFile &&
-                    ` "${duplicateFile.filename}" was uploaded on ${new Date(duplicateFile.createdAt).toLocaleDateString()}.`}
+                <div style={{ fontSize: "0.78rem", color: "var(--text-muted)" }}>
+                  "{duplicateFile.filename}" already exists in your storage.
                 </div>
-                {duplicateFile && (
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button className="fu-dup-open-btn" onClick={async () => { const u = await getFileUrl(duplicateFile.storageUrl); window.open(u, "_blank"); }}>
+                    Open existing →
+                  </button>
                   <button
                     className="fu-dup-open-btn"
-                    onClick={async () => {
-                      const url = await getFileUrl(duplicateFile.storageUrl);
-                      window.open(url, "_blank");
-                    }}
+                    style={{ background: "rgba(108,142,255,0.1)", borderColor: "rgba(108,142,255,0.3)", color: "var(--accent)" }}
+                    onClick={() => downloadFile(duplicateFile)}
                   >
-                    Open existing file →
+                    ⬇ Download
                   </button>
-                )}
+                </div>
               </div>
             )}
           </div>
 
-          <div className="fu-files">
-            <div className="fu-files-header">
-              <span className="fu-files-title">Uploaded Files</span>
-              {!isLoading && (
-                <span className="fu-files-count">
-                  {uploadedFiles.length} file{uploadedFiles.length !== 1 ? "s" : ""}
-                </span>
-              )}
+          {/* Folders grid (root only) */}
+          {currentFolderId === null && !foldersLoading && folders.length > 0 && (
+            <div>
+              <div className="fu-section-header">
+                <span className="fu-section-title">Folders</span>
+                <span className="fu-section-count">{folders.length}</span>
+              </div>
+              <div className="fu-folder-grid">
+                {folders.map((folder) => (
+                  <div
+                    key={folder._id}
+                    className="fu-folder-card"
+                    onClick={() => setCurrentFolderId(folder._id)}
+                    onContextMenu={(e) => openCtx(e, folder, "folder")}
+                  >
+                    <button className="fu-folder-card-opts" onClick={(e) => { e.stopPropagation(); openCtx(e, folder, "folder"); }}>⋯</button>
+                    <div className="fu-folder-icon">📁</div>
+                    <div className="fu-folder-name">{folder.name}</div>
+                    <div className="fu-folder-count">{uploadedFiles.filter((f) => f.folderId === folder._id).length} files</div>
+                  </div>
+                ))}
+              </div>
             </div>
+          )}
 
-            {isLoading ? (
-              <>
-                <div className="fu-skeleton" />
-                <div className="fu-skeleton" />
-                <div className="fu-skeleton" />
-              </>
-            ) : uploadedFiles.length === 0 ? (
+          {/* File list */}
+          <div>
+            <div className="fu-section-header">
+              <span className="fu-section-title">{currentFolder ? "Files" : "All Files"}</span>
+              {!filesLoading && <span className="fu-section-count">{visibleFiles.length}</span>}
+            </div>
+            {filesLoading ? (
+              <><div className="fu-skeleton" /><div className="fu-skeleton" /><div className="fu-skeleton" /></>
+            ) : visibleFiles.length === 0 ? (
               <div className="fu-empty">
                 <div className="fu-empty-icon">📂</div>
-                <div>No files uploaded yet</div>
+                <div>{currentFolder ? "No files in this folder yet" : "No files uploaded yet"}</div>
               </div>
             ) : (
-              uploadedFiles.map((file) => (
-                <div key={file._id} className="fu-file-card">
+              visibleFiles.map((file) => (
+                <div key={file._id} className="fu-file-card" onContextMenu={(e) => openCtx(e, file, "file")}>
                   <div className="fu-file-icon">{getFileIcon(file.mimetype)}</div>
                   <div className="fu-file-info">
                     <div className="fu-file-name">{file.filename}</div>
                     <div className="fu-file-meta">
-                      {formatBytes(file.size)} ·{" "}
-                      {new Date(file.createdAt).toLocaleDateString("en-US", {
-                        month: "short", day: "numeric", year: "numeric",
-                      })}
+                      {formatBytes(file.size)} · {new Date(file.createdAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}
+                      {file.folderId && folders.find(f => f._id === file.folderId) && (
+                        <span style={{ marginLeft: 6, color: "var(--folder-color)", fontSize: "0.68rem" }}>
+                          📁 {folders.find(f => f._id === file.folderId)?.name}
+                        </span>
+                      )}
                     </div>
                   </div>
-                  <button
-                    className="fu-file-open"
-                    onClick={async () => {
-                      const url = await getFileUrl(file.storageUrl);
-                      window.open(url, "_blank");
-                    }}
-                  >
-                    Open ↗
-                  </button>
+                  <div className="fu-file-actions">
+                    <button className="fu-icon-btn open"
+                      onClick={async () => { const u = await getFileUrl(file.storageUrl); window.open(u, "_blank"); }}>
+                      Open ↗
+                    </button>
+                    <button className="fu-icon-btn share" onClick={() => openShareModal(file)}>Share</button>
+                    <button className="fu-icon-btn" onClick={() => downloadFile(file)}>⬇</button>
+
+                    {/* Three-dot menu */}
+                    <div style={{ position: "relative" }} onClick={(e) => e.stopPropagation()}>
+                      <button
+                        className="fu-icon-btn"
+                        style={openMenuId === file._id ? { borderColor: "var(--border-hover)", color: "var(--text)" } : {}}
+                        onClick={() => setOpenMenuId(openMenuId === file._id ? null : file._id)}
+                      >
+                        ···
+                      </button>
+
+                      {openMenuId === file._id && (
+                        <div style={{
+                          position: "absolute", right: 0, top: "calc(100% + 6px)",
+                          background: "var(--surface2)", border: "1px solid var(--border)",
+                          borderRadius: "12px", padding: "5px", minWidth: "170px",
+                          zIndex: 200, boxShadow: "0 8px 32px rgba(0,0,0,0.4)",
+                        }}>
+                          <button className="fu-ctx-item"
+                            onClick={async () => { const u = await getFileUrl(file.storageUrl); window.open(u, "_blank"); setOpenMenuId(null); }}>
+                            ↗ Open
+                          </button>
+                          <button className="fu-ctx-item"
+                            onClick={() => { openShareModal(file); setOpenMenuId(null); }}>
+                            🔗 Share
+                          </button>
+                          <button className="fu-ctx-item"
+                            onClick={() => { downloadFile(file); setOpenMenuId(null); }}>
+                            ⬇ Download
+                          </button>
+                          <button className="fu-ctx-item"
+                            onClick={() => { setMoveTarget(file); setOpenMenuId(null); }}>
+                            📂 Move to folder
+                          </button>
+                          <div className="fu-ctx-sep" />
+                          <button className="fu-ctx-item danger"
+                            onClick={() => { setDeleteTarget({ type: "file", item: file }); setOpenMenuId(null); }}>
+                            🗑 Delete
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
                 </div>
               ))
             )}
@@ -630,10 +942,104 @@ export default function FileUpload() {
         </div>
       </div>
 
+      {/* ── Context menu ── */}
+      {ctxMenu && (
+        <div className="fu-ctx" style={{ left: ctxMenu.x, top: ctxMenu.y }} onClick={(e) => e.stopPropagation()}>
+          {ctxMenu.itemType === "file" ? (
+            <>
+              <button className="fu-ctx-item" onClick={async () => { const u = await getFileUrl((ctxMenu.item as FileType).storageUrl); window.open(u, "_blank"); setCtxMenu(null); }}>↗ Open</button>
+              <button className="fu-ctx-item" onClick={() => { openShareModal(ctxMenu.item as FileType); setCtxMenu(null); }}>🔗 Share</button>
+              <button className="fu-ctx-item" onClick={() => { downloadFile(ctxMenu.item as FileType); setCtxMenu(null); }}>⬇ Download</button>
+              <button className="fu-ctx-item" onClick={() => { setMoveTarget(ctxMenu.item as FileType); setCtxMenu(null); }}>📂 Move to folder</button>
+              <div className="fu-ctx-sep" />
+              <button className="fu-ctx-item danger" onClick={() => { setDeleteTarget({ type: "file", item: ctxMenu.item as FileType }); setCtxMenu(null); }}>🗑 Delete</button>
+            </>
+          ) : (
+            <>
+              <button className="fu-ctx-item" onClick={() => { setCurrentFolderId((ctxMenu.item as FolderType)._id); setCtxMenu(null); }}>📂 Open folder</button>
+              <button className="fu-ctx-item" onClick={() => { downloadFolder(ctxMenu.item as FolderType); setCtxMenu(null); }}>⬇ Download as ZIP</button>
+              <div className="fu-ctx-sep" />
+              <button className="fu-ctx-item danger" onClick={() => { setDeleteTarget({ type: "folder", item: ctxMenu.item as FolderType }); setCtxMenu(null); }}>🗑 Delete folder</button>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ── Share modal ── */}
+      {shareTarget && (
+        <div className="fu-overlay" onClick={() => setShareTarget(null)}>
+          <div className="fu-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="fu-modal-title">🔗 Share file</div>
+            <div className="fu-modal-sub">Anyone with the link can view "{shareTarget.filename}"</div>
+            {shareUrl ? (
+              <div className="fu-share-url-wrap">
+                <input className="fu-share-url" readOnly value={shareUrl} />
+                <button className={`fu-copy-btn ${shareCopied ? "copied" : ""}`} onClick={copyShareUrl}>
+                  {shareCopied ? "✓ Copied" : "Copy"}
+                </button>
+              </div>
+            ) : (
+              <div style={{ color: "var(--text-muted)", fontSize: "0.82rem" }}>Generating link…</div>
+            )}
+            <div className="fu-modal-actions">
+              <button className="fu-modal-btn secondary" onClick={() => setShareTarget(null)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Move modal ── */}
+      {moveTarget && (
+        <div className="fu-overlay" onClick={() => setMoveTarget(null)}>
+          <div className="fu-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="fu-modal-title">📂 Move file</div>
+            <div className="fu-modal-sub">Choose a destination for "{moveTarget.filename}"</div>
+            <div className="fu-folder-picker">
+              <button className={`fu-picker-item ${moveTarget.folderId === null ? "active" : ""}`} onClick={() => moveFile(moveTarget, null)}>
+                🏠 Root (no folder)
+              </button>
+              {folders.map((folder) => (
+                <button
+                  key={folder._id}
+                  className={`fu-picker-item ${moveTarget.folderId === folder._id ? "active" : ""}`}
+                  onClick={() => moveFile(moveTarget, folder._id)}
+                >
+                  📁 {folder.name}
+                  <span style={{ marginLeft: "auto", fontSize: "0.7rem", color: "var(--text-muted)" }}>
+                    {uploadedFiles.filter(f => f.folderId === folder._id).length}
+                  </span>
+                </button>
+              ))}
+            </div>
+            <div className="fu-modal-actions">
+              <button className="fu-modal-btn secondary" onClick={() => setMoveTarget(null)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Delete modal ── */}
+      {deleteTarget && (
+        <div className="fu-overlay" onClick={() => setDeleteTarget(null)}>
+          <div className="fu-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="fu-modal-title">🗑 Confirm delete</div>
+            <div className="fu-modal-sub">
+              {deleteTarget.type === "file"
+                ? `Delete "${(deleteTarget.item as FileType).filename}"? This cannot be undone.`
+                : `Delete folder "${deleteTarget.item.name}" and all its contents? This cannot be undone.`}
+            </div>
+            <div className="fu-modal-actions">
+              <button className="fu-modal-btn secondary" onClick={() => setDeleteTarget(null)}>Cancel</button>
+              <button className="fu-modal-btn danger" onClick={confirmDelete}>Delete</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Toast ── */}
       {toast && (
         <div className={`fu-toast ${toast.type}`}>
-          {toast.type === "success" ? "✓" : toast.type === "warn" ? "⚠" : "✕"}{" "}
-          {toast.msg}
+          {toast.type === "success" ? "✓" : toast.type === "warn" ? "⚠" : "✕"} {toast.msg}
         </div>
       )}
     </>

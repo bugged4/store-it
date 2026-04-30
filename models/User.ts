@@ -2,10 +2,18 @@
 import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
 
+function isPasswordRequired(this: { provider?: string }): boolean {
+  return this.provider === 'credentials';
+}
+
 const UserSchema = new mongoose.Schema({
   email: { type: String, required: true, unique: true, lowercase: true, trim: true },
   name:  { type: String, required: true, trim: true },
-  password: { type: String, required: true, select: false}, 
+  password: {
+    type: String,
+    required: isPasswordRequired,
+    select: false,
+  },
   provider:     { type: String, default: 'credentials' },  
   providerId:   { type: String },  
   storageused:  { type: Number, default: 0 },
@@ -17,7 +25,7 @@ const UserSchema = new mongoose.Schema({
 UserSchema.index({ email: 1 });
 
 UserSchema.pre("save", async function () {
-  if (!this.isModified("password")) return
+  if (!this.password || !this.isModified("password")) return
   const salt = await bcrypt.genSalt(10)
   this.password = await bcrypt.hash(this.password, salt)
 })

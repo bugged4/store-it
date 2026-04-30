@@ -85,7 +85,6 @@ export const authOptions: NextAuthOptions = {
     const existingUser = await User.findOne({ email });
 
         if (existingUser) {
-          // 🔥 LINK ACCOUNT instead of blocking
           await User.updateOne(
             { email },
             {

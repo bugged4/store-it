@@ -76,8 +76,13 @@ export const authOptions: NextAuthOptions = {
       try {
         await connectDB();
 
-        const email = user.email!.toLowerCase();
-        const existingUser = await User.findOne({ email });
+       const email = user.email?.toLowerCase();
+
+   if (!email) {
+  console.error("No email returned from Google");
+  return false; // or handle differently
+    }
+    const existingUser = await User.findOne({ email });
 
         if (existingUser) {
           // 🔥 LINK ACCOUNT instead of blocking

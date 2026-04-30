@@ -1,27 +1,34 @@
 "use client"
-import { useRouter } from 'next/navigation'
+
 import * as React from "react"
+import { useRouter } from "next/navigation"
+import { signIn } from "next-auth/react"
+
 import { zodResolver } from "@hookform/resolvers/zod"
 import { Controller, useForm, Resolver } from "react-hook-form"
 import { toast } from "sonner"
 import * as z from "zod"
- import { signIn } from "next-auth/react";
-import { Button } from "@/components/ui/button"
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardFooter,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card"
-import {
-  Field,
-  FieldError,
-  FieldGroup,
-  FieldLabel,
-} from "@/components/ui/field"
-import { Input } from "@/components/ui/input"
+
+import { 
+  Card, 
+  CardHeader, 
+  CardTitle, 
+  CardDescription, 
+  CardContent, 
+  CardFooter 
+} from "./ui/card"
+
+import { Button } from "./ui/button"
+
+import { 
+  Field, 
+  FieldLabel, 
+  FieldError 
+} from "./ui/field"
+
+import {InputGroup} from "./ui/input-group"
+
+import { Input } from "./ui/input"
 
 type FormType = "sign-up" | "sign-in"
 
@@ -153,7 +160,7 @@ async function onSubmit(data: FormValues) {
 
       <CardContent>
         <form id="form-rhf-demo" onSubmit={form.handleSubmit(onSubmit)}>
-          <FieldGroup>
+          <InputGroup>
             {/* Email */}
             <Controller
               name="email"
@@ -218,7 +225,7 @@ async function onSubmit(data: FormValues) {
                 </Field>
               )}
             />
-          </FieldGroup>
+          </InputGroup>
         </form>
       </CardContent>
 

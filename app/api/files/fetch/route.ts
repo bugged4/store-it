@@ -5,7 +5,7 @@ import File from "@/models/File";
 import { NextResponse } from "next/server";
 
 
-export async function GET(req: Request) {
+export async function GET() {
   const session = await getServerSession(authOptions);
 
   if (!session) {
@@ -25,7 +25,12 @@ export async function GET(req: Request) {
     // ── NEW: return grouped structure if ?grouped=true ──────────────
     
 
-    return NextResponse.json(files);
+    const normalizedFiles = files.map((file) => ({
+      ...file,
+      folderId: file.folderId?.toString?.() ?? file.folders_id?.toString?.() ?? null,
+    }));
+
+    return NextResponse.json(normalizedFiles);
 
   } catch (error) {
     console.error("Failed to fetch files:", error);

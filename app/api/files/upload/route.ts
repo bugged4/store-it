@@ -72,6 +72,7 @@ export async function POST(req: NextRequest) {
       size,
       storageUrl: key,
       folders_id: folderId,
+      folderId,
       status: "pending",
     });
     console.log({

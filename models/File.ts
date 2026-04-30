@@ -11,6 +11,7 @@ const FileSchema = new Schema({
   mimetype:   { type: String },
   size:       { type: Number },
   folders_id: { type: Schema.Types.ObjectId, default: null },
+  folderId:   { type: Schema.Types.ObjectId, default: null },
   owner_id:   { type: Schema.Types.ObjectId, required: true },
   storageUrl: { type: String, required: true },           // the S3 key
   status:     { type: String, enum: ['pending', 'uploaded'], default: 'pending' },

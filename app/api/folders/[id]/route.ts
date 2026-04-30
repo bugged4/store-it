@@ -1,45 +1,101 @@
 // app/api/folders/[id]/route.ts
-import { NextRequest, NextResponse } from "next/server";
-import { ObjectId } from "mongodb";
 import { DeleteObjectsCommand } from "@aws-sdk/client-s3";
+import { ObjectId } from "mongodb";
 import { getServerSession } from "next-auth";
-import connectMongoose from "@/lib/mongoose";
+import { NextRequest, NextResponse } from "next/server";
 import { authOptions } from "@/lib/[...nextauth]";
-import { s3, BUCKET } from "@/lib/s3";
-import Folder from "@/models/Folder";
+import connectMongoose from "@/lib/mongoose";
+import { BUCKET, s3 } from "@/lib/s3";
 import File from "@/models/File";
+import Folder from "@/models/Folder";
 
-// ── Auth helper ───────────────────────────────────────────────────────────────
 async function getUserId(): Promise<string> {
   const session = await getServerSession(authOptions);
   if (!session?.user?.id) {
-    const err: any = new Error("Unauthorised");
+    const err = new Error("Unauthorised") as Error & { status?: number };
     err.status = 401;
     throw err;
   }
   return session.user.id;
 }
 
-// ── DELETE /api/folders/:id ───────────────────────────────────────────────────
-// Query param: ?deleteFiles=true  → permanently delete every file inside the folder
-//              (omit / false)     → move contained files to root (folderId = null)
-export async function DELETE(
-  req: NextRequest,
-  { params }: { params: { id: string } }
-) {
+type RouteContext = {
+  params: Promise<{ id: string }>;
+};
+
+// PATCH /api/folders/:id
+// Body: { parentId: string | null }
+export async function PATCH(req: NextRequest, { params }: RouteContext) {
   try {
     const userId = await getUserId();
+    const { id } = await params;
 
-    if (!ObjectId.isValid(params.id)) {
+    if (!ObjectId.isValid(id)) {
+      return NextResponse.json({ error: "Invalid folder id" }, { status: 400 });
+    }
+
+    const body = await req.json().catch(() => null);
+    if (!body || !("parentId" in body)) {
+      return NextResponse.json({ error: "parentId is required" }, { status: 400 });
+    }
+
+    const { parentId } = body as { parentId: string | null };
+
+    if (parentId !== null && !ObjectId.isValid(parentId)) {
+      return NextResponse.json({ error: "Invalid parentId" }, { status: 400 });
+    }
+
+    if (parentId === id) {
+      return NextResponse.json({ error: "A folder cannot be moved into itself" }, { status: 400 });
+    }
+
+    await connectMongoose();
+
+    const folder = await Folder.findOne({ _id: id, owner_id: userId }).lean();
+    if (!folder) {
+      return NextResponse.json({ error: "Folder not found" }, { status: 404 });
+    }
+
+    if (parentId !== null) {
+      const targetFolder = await Folder.findOne({ _id: parentId, owner_id: userId }).lean();
+      if (!targetFolder) {
+        return NextResponse.json({ error: "Target folder not found" }, { status: 404 });
+      }
+    }
+
+    const updated = await Folder.findOneAndUpdate(
+      { _id: id, owner_id: userId },
+      { $set: { parent_id: parentId ?? null, updatedAt: new Date() } },
+      { new: true }
+    ).lean();
+
+    return NextResponse.json({ folder: updated });
+  } catch (err: unknown) {
+    if ((err as { status?: number })?.status === 401) {
+      return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
+    }
+    console.error("[PATCH /api/folders/:id]", err);
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+  }
+}
+
+// DELETE /api/folders/:id
+// ?deleteFiles=true permanently deletes files in the folder.
+// Omit deleteFiles to move contained files and child folders to root.
+export async function DELETE(req: NextRequest, { params }: RouteContext) {
+  try {
+    const userId = await getUserId();
+    const { id } = await params;
+
+    if (!ObjectId.isValid(id)) {
       return NextResponse.json({ error: "Invalid folder id" }, { status: 400 });
     }
 
     await connectMongoose();
     const deleteFiles = req.nextUrl.searchParams.get("deleteFiles") === "true";
 
-    // ── 1. Verify ownership ────────────────────────────────────────────────
     const folder = await Folder.findOne({
-      _id:      params.id,
+      _id: id,
       owner_id: userId,
     }).lean();
 
@@ -47,19 +103,17 @@ export async function DELETE(
       return NextResponse.json({ error: "Folder not found" }, { status: 404 });
     }
 
-    // ── 2. Handle contained files ──────────────────────────────────────────
     const containedFiles = await File.find({
-      folderId: params.id,
+      $or: [{ folderId: id }, { folders_id: id }],
       owner_id: userId,
-      status:   "uploaded",
+      status: "uploaded",
     }).lean();
 
     if (deleteFiles && containedFiles.length > 0) {
-      // a) Delete from S3 in one batched call (max 1000 per request)
-      const s3Keys = containedFiles.map((f) => ({ Key: f.storageUrl }));
+      const s3Keys = containedFiles.map((file) => ({ Key: file.storageUrl }));
 
       for (let i = 0; i < s3Keys.length; i += 1000) {
-        await s3.send(                        // ← was s3Client
+        await s3.send(
           new DeleteObjectsCommand({
             Bucket: BUCKET,
             Delete: { Objects: s3Keys.slice(i, i + 1000), Quiet: true },
@@ -67,26 +121,32 @@ export async function DELETE(
         );
       }
 
-      // b) Delete DB records
-      await File.deleteMany({ folderId: params.id, owner_id: userId });
+      await File.deleteMany({
+        $or: [{ folderId: id }, { folders_id: id }],
+        owner_id: userId,
+      });
     } else {
-      // Move files to root so they are not orphaned
       await File.updateMany(
-        { folderId: params.id, owner_id: userId },
-        { $set: { folderId: null } }
+        { $or: [{ folderId: id }, { folders_id: id }], owner_id: userId },
+        { $set: { folderId: null, folders_id: null } }
       );
     }
 
-    // ── 3. Delete the folder record ────────────────────────────────────────
-    await Folder.deleteOne({ _id: params.id });
+    const movedChildFolders = await Folder.updateMany(
+      { parent_id: id, owner_id: userId },
+      { $set: { parent_id: null } }
+    );
+
+    await Folder.deleteOne({ _id: id, owner_id: userId });
 
     return NextResponse.json({
-      success:      true,
+      success: true,
       deletedFiles: deleteFiles ? containedFiles.length : 0,
-      movedToRoot:  deleteFiles ? 0 : containedFiles.length,
+      movedToRoot: deleteFiles ? 0 : containedFiles.length,
+      movedFoldersToRoot: movedChildFolders.modifiedCount,
     });
-  } catch (err: any) {
-    if (err?.status === 401) {
+  } catch (err: unknown) {
+    if ((err as { status?: number })?.status === 401) {
       return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
     }
     console.error("[DELETE /api/folders/:id]", err);

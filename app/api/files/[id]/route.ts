@@ -1,36 +1,36 @@
 // app/api/files/[id]/route.ts
-import { NextRequest, NextResponse } from "next/server";
-import { ObjectId } from "mongodb";
 import { DeleteObjectCommand } from "@aws-sdk/client-s3";
+import { ObjectId } from "mongodb";
 import { getServerSession } from "next-auth";
+import { NextRequest, NextResponse } from "next/server";
+import { authOptions } from "@/lib/[...nextauth]";
 import connectMongoose from "@/lib/mongoose";
-import { authOptions } from "@/lib/[...nextauth]";          // ← fixed path
-import { s3, BUCKET } from "@/lib/s3";
+import { BUCKET, s3 } from "@/lib/s3";
 import File from "@/models/File";
 import Folder from "@/models/Folder";
 
-// ── Auth helper ───────────────────────────────────────────────────────────────
 async function getUserId(): Promise<string> {
   const session = await getServerSession(authOptions);
   if (!session?.user?.id) {
-    const err: any = new Error("Unauthorised");
+    const err = new Error("Unauthorised") as Error & { status?: number };
     err.status = 401;
     throw err;
   }
-  return session.user.id;   // ← returns string, not { userId }
+  return session.user.id;
 }
 
-// ── PATCH /api/files/:id ──────────────────────────────────────────────────────
-// Body: { folderId: string | null }
-// Moves the file into the given folder, or to root when folderId is null.
-export async function PATCH(
-  req: NextRequest,
-  { params }: { params: { id: string } }
-) {
-  try {
-    const userId = await getUserId();   // ← plain string, not destructured
+type RouteContext = {
+  params: Promise<{ id: string }>;
+};
 
-    if (!ObjectId.isValid(params.id)) {
+// PATCH /api/files/:id
+// Body: { folderId: string | null }
+export async function PATCH(req: NextRequest, { params }: RouteContext) {
+  try {
+    const userId = await getUserId();
+    const { id } = await params;
+
+    if (!ObjectId.isValid(id)) {
       return NextResponse.json({ error: "Invalid file id" }, { status: 400 });
     }
 
@@ -43,9 +43,8 @@ export async function PATCH(
 
     await connectMongoose();
 
-    // ── 1. Verify file ownership ───────────────────────────────────────────
     const file = await File.findOne({
-      _id:      params.id,
+      _id: id,
       owner_id: userId,
     }).lean();
 
@@ -53,14 +52,13 @@ export async function PATCH(
       return NextResponse.json({ error: "File not found" }, { status: 404 });
     }
 
-    // ── 2. If a target folder is given, verify it also belongs to this user ─
     if (folderId !== null) {
       if (!ObjectId.isValid(folderId)) {
         return NextResponse.json({ error: "Invalid folderId" }, { status: 400 });
       }
 
       const folder = await Folder.findOne({
-        _id:      folderId,
+        _id: folderId,
         owner_id: userId,
       }).lean();
 
@@ -69,16 +67,21 @@ export async function PATCH(
       }
     }
 
-    // ── 3. Update the file record ──────────────────────────────────────────
     const updated = await File.findOneAndUpdate(
-      { _id: params.id },
-      { $set: { folderId: folderId ?? null, updatedAt: new Date() } },
-      { new: true }           // ← Mongoose equivalent of returnDocument: "after"
+      { _id: id, owner_id: userId },
+      {
+        $set: {
+          folderId: folderId ?? null,
+          folders_id: folderId ?? null,
+          updatedAt: new Date(),
+        },
+      },
+      { new: true }
     ).lean();
 
     return NextResponse.json({ file: updated });
-  } catch (err: any) {
-    if (err?.status === 401) {
+  } catch (err: unknown) {
+    if ((err as { status?: number })?.status === 401) {
       return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
     }
     console.error("[PATCH /api/files/:id]", err);
@@ -86,24 +89,20 @@ export async function PATCH(
   }
 }
 
-// ── DELETE /api/files/:id ─────────────────────────────────────────────────────
-// Removes the file record from MongoDB and deletes the object from S3.
-export async function DELETE(
-  req: NextRequest,
-  { params }: { params: { id: string } }
-) {
+// DELETE /api/files/:id
+export async function DELETE(req: NextRequest, { params }: RouteContext) {
   try {
-    const userId = await getUserId();   // ← was requireAuth(req) which doesn't exist
+    const userId = await getUserId();
+    const { id } = await params;
 
-    if (!ObjectId.isValid(params.id)) {
+    if (!ObjectId.isValid(id)) {
       return NextResponse.json({ error: "Invalid file id" }, { status: 400 });
     }
 
     await connectMongoose();
 
-    // ── 1. Verify ownership and fetch S3 key ──────────────────────────────
     const file = await File.findOne({
-      _id:      params.id,
+      _id: id,
       owner_id: userId,
     }).lean();
 
@@ -111,17 +110,12 @@ export async function DELETE(
       return NextResponse.json({ error: "File not found" }, { status: 404 });
     }
 
-    // ── 2. Delete from S3 ─────────────────────────────────────────────────
-    await s3.send(                      // ← was s3Client which was never imported
-      new DeleteObjectCommand({ Bucket: BUCKET, Key: file.storageUrl })
-    );
-
-    // ── 3. Delete DB record ────────────────────────────────────────────────
-    await File.deleteOne({ _id: params.id });
+    await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: file.storageUrl }));
+    await File.deleteOne({ _id: id, owner_id: userId });
 
     return NextResponse.json({ success: true, deleted: file.filename });
-  } catch (err: any) {
-    if (err?.status === 401) {
+  } catch (err: unknown) {
+    if ((err as { status?: number })?.status === 401) {
       return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
     }
     console.error("[DELETE /api/files/:id]", err);

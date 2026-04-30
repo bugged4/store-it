@@ -26,6 +26,7 @@ type FolderType = {
   _id: string;
   name: string;
   owner_id: string;
+  parent_id?: string | null;
   createdAt: string;
 };
 
@@ -38,6 +39,11 @@ type ContextMenu = {
 
 type DeleteTarget = { type: "file"; item: FileType } | { type: "folder"; item: FolderType };
 type ToastMsg = { msg: string; type: "error" | "warn" | "success" };
+type UploadError = Error & {
+  isCancelled?: boolean;
+  isDuplicate?: boolean;
+  existingFile?: FileType;
+};
 
 // ── Utils ────────────────────────────────────────────────────────────────────
 async function getFileHash(file: File): Promise<string> {
@@ -87,6 +93,7 @@ export default function FileUpload() {
   // Context menu & modals
   const [ctxMenu, setCtxMenu] = useState<ContextMenu | null>(null);
   const [moveTarget, setMoveTarget] = useState<FileType | null>(null);
+  const [moveFolderTarget, setMoveFolderTarget] = useState<FolderType | null>(null);
   const [shareTarget, setShareTarget] = useState<FileType | null>(null);
   const [shareUrl, setShareUrl] = useState("");
   const [shareCopied, setShareCopied] = useState(false);
@@ -134,6 +141,7 @@ export default function FileUpload() {
 
   const uploadedFiles = files.filter((f) => f.status === "uploaded");
   const visibleFiles = uploadedFiles.filter((f) => f.folderId === currentFolderId);
+  const visibleFolders = folders.filter((folder) => (folder.parent_id ?? null) === currentFolderId);
 
   async function parseError(res: Response, fallback: string) {
     const data = await res.json().catch(() => ({}));
@@ -282,6 +290,19 @@ export default function FileUpload() {
     } catch { setToast({ msg: "Move failed.", type: "error" }); }
   };
 
+  const moveFolder = async (folder: FolderType, targetFolderId: string | null) => {
+    try {
+      const res = await fetch(`/api/folders/${folder._id}`, {
+        method: "PATCH", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ parentId: targetFolderId }),
+      });
+      if (!res.ok) throw new Error("Failed");
+      queryClient.invalidateQueries({ queryKey: ["folders"] });
+      setMoveFolderTarget(null);
+      setToast({ msg: `Moved folder to ${targetFolderId ? folders.find(f => f._id === targetFolderId)?.name : "root"}.`, type: "success" });
+    } catch { setToast({ msg: "Folder move failed.", type: "error" }); }
+  };
+
   const confirmDelete = async () => {
     if (!deleteTarget) return;
     try {
@@ -308,7 +329,7 @@ export default function FileUpload() {
     try {
       const res = await fetch("/api/folders", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name }),
+        body: JSON.stringify({ name, parent_id: currentFolderId }),
       });
       if (!res.ok) throw new Error("Failed");
       queryClient.invalidateQueries({ queryKey: ["folders"] });
@@ -344,15 +365,16 @@ export default function FileUpload() {
         setToast({ msg: `"${file.name}" uploaded successfully!`, type: "success" });
         setTimeout(() => setStatus("idle"), 3000);
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const uploadError = err as UploadError;
       if (intervalRef.current) clearInterval(intervalRef.current);
-      if (err?.isCancelled) return;
-      if (err?.isDuplicate) {
-        setStatus("duplicate"); setDuplicateFile(err.existingFile ?? null);
+      if (uploadError?.isCancelled) return;
+      if (uploadError?.isDuplicate) {
+        setStatus("duplicate"); setDuplicateFile(uploadError.existingFile ?? null);
         setToast({ msg: "This file already exists in your storage.", type: "warn" });
       } else {
-        setStatus("error"); setErrorMsg(err?.message || "Upload failed");
-        setToast({ msg: err?.message || "Upload failed.", type: "error" });
+        setStatus("error"); setErrorMsg(uploadError?.message || "Upload failed");
+        setToast({ msg: uploadError?.message || "Upload failed.", type: "error" });
       }
     }
   };
@@ -383,13 +405,15 @@ export default function FileUpload() {
         @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500&display=swap');
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-        .fu-root {
+        .fu-root, .fu-ctx, .fu-overlay, .fu-toast {
           --bg: #0d0f14; --surface: #13161e; --surface2: #1a1e28;
           --border: #252a38; --border-hover: #353c52;
           --accent: #6c8eff; --accent-glow: rgba(108,142,255,0.15); --accent2: #a78bfa;
           --success: #34d399; --warn: #fbbf24; --error: #f87171;
           --text: #e8eaf0; --text-muted: #6b7280; --text-dim: #9ca3af;
           --danger: #f87171; --folder-color: #fbbf24;
+        }
+        .fu-root {
           font-family: 'DM Sans', sans-serif;
           background: var(--bg); min-height: 100vh; padding: 48px 24px; color: var(--text);
         }
@@ -814,7 +838,7 @@ export default function FileUpload() {
               <div className="fu-duplicate" onClick={(e) => e.stopPropagation()}>
                 <div className="fu-duplicate-title">⚠ Duplicate file detected</div>
                 <div style={{ fontSize: "0.78rem", color: "var(--text-muted)" }}>
-                  "{duplicateFile.filename}" already exists in your storage.
+                  <span>{duplicateFile.filename}</span> already exists in your storage.
                 </div>
                 <div style={{ display: "flex", gap: 8 }}>
                   <button className="fu-dup-open-btn" onClick={async () => { const u = await getFileUrl(duplicateFile.storageUrl); window.open(u, "_blank"); }}>
@@ -832,15 +856,15 @@ export default function FileUpload() {
             )}
           </div>
 
-          {/* Folders grid (root only) */}
-          {currentFolderId === null && !foldersLoading && folders.length > 0 && (
+          {/* Folders grid */}
+          {!foldersLoading && visibleFolders.length > 0 && (
             <div>
               <div className="fu-section-header">
                 <span className="fu-section-title">Folders</span>
-                <span className="fu-section-count">{folders.length}</span>
+                <span className="fu-section-count">{visibleFolders.length}</span>
               </div>
               <div className="fu-folder-grid">
-                {folders.map((folder) => (
+                {visibleFolders.map((folder) => (
                   <div
                     key={folder._id}
                     className="fu-folder-card"
@@ -957,6 +981,7 @@ export default function FileUpload() {
           ) : (
             <>
               <button className="fu-ctx-item" onClick={() => { setCurrentFolderId((ctxMenu.item as FolderType)._id); setCtxMenu(null); }}>📂 Open folder</button>
+              <button className="fu-ctx-item" onClick={() => { setMoveFolderTarget(ctxMenu.item as FolderType); setCtxMenu(null); }}>Move folder</button>
               <button className="fu-ctx-item" onClick={() => { downloadFolder(ctxMenu.item as FolderType); setCtxMenu(null); }}>⬇ Download as ZIP</button>
               <div className="fu-ctx-sep" />
               <button className="fu-ctx-item danger" onClick={() => { setDeleteTarget({ type: "folder", item: ctxMenu.item as FolderType }); setCtxMenu(null); }}>🗑 Delete folder</button>
@@ -970,7 +995,7 @@ export default function FileUpload() {
         <div className="fu-overlay" onClick={() => setShareTarget(null)}>
           <div className="fu-modal" onClick={(e) => e.stopPropagation()}>
             <div className="fu-modal-title">🔗 Share file</div>
-            <div className="fu-modal-sub">Anyone with the link can view "{shareTarget.filename}"</div>
+            <div className="fu-modal-sub">Anyone with the link can view <span>{shareTarget.filename}</span></div>
             {shareUrl ? (
               <div className="fu-share-url-wrap">
                 <input className="fu-share-url" readOnly value={shareUrl} />
@@ -993,7 +1018,7 @@ export default function FileUpload() {
         <div className="fu-overlay" onClick={() => setMoveTarget(null)}>
           <div className="fu-modal" onClick={(e) => e.stopPropagation()}>
             <div className="fu-modal-title">📂 Move file</div>
-            <div className="fu-modal-sub">Choose a destination for "{moveTarget.filename}"</div>
+            <div className="fu-modal-sub">Choose a destination for <span>{moveTarget.filename}</span></div>
             <div className="fu-folder-picker">
               <button className={`fu-picker-item ${moveTarget.folderId === null ? "active" : ""}`} onClick={() => moveFile(moveTarget, null)}>
                 🏠 Root (no folder)
@@ -1013,6 +1038,38 @@ export default function FileUpload() {
             </div>
             <div className="fu-modal-actions">
               <button className="fu-modal-btn secondary" onClick={() => setMoveTarget(null)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+
+      {moveFolderTarget && (
+        <div className="fu-overlay" onClick={() => setMoveFolderTarget(null)}>
+          <div className="fu-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="fu-modal-title">Move folder</div>
+            <div className="fu-modal-sub">Choose a destination for <span>{moveFolderTarget.name}</span></div>
+            <div className="fu-folder-picker">
+              <button
+                className={`fu-picker-item ${(moveFolderTarget.parent_id ?? null) === null ? "active" : ""}`}
+                onClick={() => moveFolder(moveFolderTarget, null)}
+              >
+                Root
+              </button>
+              {folders
+                .filter((folder) => folder._id !== moveFolderTarget._id)
+                .map((folder) => (
+                  <button
+                    key={folder._id}
+                    className={`fu-picker-item ${moveFolderTarget.parent_id === folder._id ? "active" : ""}`}
+                    onClick={() => moveFolder(moveFolderTarget, folder._id)}
+                  >
+                    {folder.name}
+                  </button>
+                ))}
+            </div>
+            <div className="fu-modal-actions">
+              <button className="fu-modal-btn secondary" onClick={() => setMoveFolderTarget(null)}>Cancel</button>
             </div>
           </div>
         </div>
@@ -1045,3 +1102,4 @@ export default function FileUpload() {
     </>
   );
 }
+

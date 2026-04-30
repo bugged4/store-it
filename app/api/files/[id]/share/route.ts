@@ -19,7 +19,7 @@ const SHARE_TTL_MS      = SHARE_TTL_SECONDS * 1000;
 async function getUserId(): Promise<string> {
   const session = await getServerSession(authOptions);
   if (!session?.user?.id) {
-    const err: any = new Error("Unauthorised");
+    const err = new Error("Unauthorised") as Error & { status?: number };
     err.status = 401;
     throw err;
   }
@@ -31,12 +31,16 @@ async function getUserId(): Promise<string> {
 // Idempotent — returns the existing share if still valid (> 30 min remaining).
 export async function POST(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     const userId = await getUserId();
 
-    if (!ObjectId.isValid(params.id)) {
+    const { id } = await params;
+
+    
+
+    if (!ObjectId.isValid(id)) {
       return NextResponse.json({ error: "Invalid file id" }, { status: 400 });
     }
 
@@ -45,7 +49,7 @@ export async function POST(
 
     // ── 1. Verify file ownership ───────────────────────────────────────────
     const file = await File.findOne({
-      _id:      params.id,
+      _id:      id,
       owner_id: userId,
       status:   "uploaded",
     }).lean();
@@ -58,7 +62,7 @@ export async function POST(
     const minRemaining = new Date(now.getTime() + 30 * 60 * 1000);
 
     const existingShare = await FileShare.findOne({
-      fileId:    params.id,
+      fileId:    id,
       owner_id:  userId,
       expiresAt: { $gt: minRemaining },
     }).lean();
@@ -89,7 +93,7 @@ export async function POST(
     // ── 4. Persist the share record ────────────────────────────────────────
     // TTL index lives on the FileShare schema — not recreated here each call
     await FileShare.create({
-      fileId:   params.id,
+      fileId:   id,
       filename: file.filename,
       owner_id: userId,
       shareUrl,
@@ -97,8 +101,8 @@ export async function POST(
     });
 
     return NextResponse.json({ shareUrl, expiresAt, reused: false });
-  } catch (err: any) {
-    if (err?.status === 401) {
+  } catch (err: unknown) {
+    if ((err as { status?: number })?.status === 401) {
       return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
     }
     console.error("[POST /api/files/:id/share]", err);
@@ -112,28 +116,33 @@ export async function POST(
 // TTL expires — shorten SHARE_TTL_SECONDS above if near-instant revocation matters.
 export async function DELETE(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     const userId = await getUserId();
 
-    if (!ObjectId.isValid(params.id)) {
+    const { id } = await params;
+
+    
+
+    if (!ObjectId.isValid(id)) {
       return NextResponse.json({ error: "Invalid file id" }, { status: 400 });
     }
 
     await connectDB();
 
     const result = await FileShare.deleteMany({
-      fileId:   params.id,
+      fileId:   id,
       owner_id: userId,
     });
 
     return NextResponse.json({ success: true, revoked: result.deletedCount });
-  } catch (err: any) {
-    if (err?.status === 401) {
+  } catch (err: unknown) {
+    if ((err as { status?: number })?.status === 401) {
       return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
     }
     console.error("[DELETE /api/files/:id/share]", err);
     return NextResponse.json({ error: "Internal server error" }, { status: 500 });
   }
 }
+

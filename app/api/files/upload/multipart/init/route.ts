@@ -79,6 +79,7 @@ export async function POST(req: NextRequest) {
     destination: key,
     uploadId: UploadId,
     folders_id: folderId ?? null,
+    folderId: folderId ?? null,
     status: "pending",
   });
 

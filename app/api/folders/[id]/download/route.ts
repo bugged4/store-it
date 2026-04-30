@@ -14,7 +14,7 @@ import File from "@/models/File";
 async function getUserId(): Promise<string> {
   const session = await getServerSession(authOptions);
   if (!session?.user?.id) {
-    const err: any = new Error("Unauthorised");
+    const err = new Error("Unauthorised") as Error & { status?: number };
     err.status = 401;
     throw err;
   }
@@ -26,12 +26,16 @@ async function getUserId(): Promise<string> {
 // a single ZIP archive. Filename collisions are resolved by appending (1), (2) …
 export async function GET(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     const userId = await getUserId();
 
-    if (!ObjectId.isValid(params.id)) {
+    const { id } = await params;
+
+    
+
+    if (!ObjectId.isValid(id)) {
       return NextResponse.json({ error: "Invalid folder id" }, { status: 400 });
     }
 
@@ -39,7 +43,7 @@ export async function GET(
 
     // ── 1. Verify folder ownership ─────────────────────────────────────────
     const folder = await Folder.findOne({
-      _id:      params.id,
+      _id:      id,
       owner_id: userId,
     }).lean();
 
@@ -49,7 +53,7 @@ export async function GET(
 
     // ── 2. Fetch all uploaded file records in folder ───────────────────────
     const files = await File.find({
-      folderId: params.id,
+      folderId: id,
       owner_id: userId,
       status:   "uploaded",
     }).lean();
@@ -106,8 +110,8 @@ export async function GET(
         "Cache-Control":       "no-store",
       },
     });
-  } catch (err: any) {
-    if (err?.status === 401) {
+  } catch (err: unknown) {
+    if ((err as { status?: number })?.status === 401) {
       return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
     }
     console.error("[GET /api/folders/:id/download]", err);
@@ -121,3 +125,4 @@ function dedupName(original: string, count: number): string {
   if (dot === -1) return `${original} (${count})`;
   return `${original.slice(0, dot)} (${count})${original.slice(dot)}`;
 }
+

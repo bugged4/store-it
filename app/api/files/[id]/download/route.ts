@@ -15,7 +15,7 @@ const DOWNLOAD_URL_TTL = 60; // seconds — short-lived, browser fetches immedia
 async function getUserId(): Promise<string> {
   const session = await getServerSession(authOptions);
   if (!session?.user?.id) {
-    const err: any = new Error("Unauthorised");
+    const err = new Error("Unauthorised") as Error & { status?: number };
     err.status = 401;
     throw err;
   }
@@ -27,12 +27,13 @@ async function getUserId(): Promise<string> {
 // download the file rather than opening it inline.
 export async function GET(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     const userId = await getUserId();   // ← was broken `await (req)` call
+    const { id } = await params;
 
-    if (!ObjectId.isValid(params.id)) {
+    if (!ObjectId.isValid(id)) {
       return NextResponse.json({ error: "Invalid file id" }, { status: 400 });
     }
 
@@ -40,7 +41,7 @@ export async function GET(
 
     // ── 1. Fetch file record ───────────────────────────────────────────────
     const file = await File.findOne({   // ← replaced db.collection("files")
-      _id:      params.id,
+      _id:      id,
       owner_id: userId,
       status:   "uploaded",
     }).lean();
@@ -64,11 +65,12 @@ export async function GET(
 
     // ── 3. Redirect — browser follows immediately and starts the download ──
     return NextResponse.redirect(signedUrl, { status: 302 });
-  } catch (err: any) {
-    if (err?.status === 401) {
+  } catch (err: unknown) {
+    if ((err as { status?: number })?.status === 401) {
       return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
     }
     console.error("[GET /api/files/:id/download]", err);
     return NextResponse.json({ error: "Internal server error" }, { status: 500 });
   }
 }
+

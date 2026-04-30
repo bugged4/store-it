@@ -22,12 +22,15 @@ const SHARE_TTL_SECONDS  = 7 * 24 * 60 * 60;
 const SHARE_TTL_MS       = SHARE_TTL_SECONDS * 1000;
 const REUSE_THRESHOLD_MS = 30 * 60 * 1000;
 
+type LeanId = { _id: { toString(): string } };
+type LeanFolderName = { name: string };
+
 // ── Auth helper ───────────────────────────────────────────────────────────────
 // Returns the session userId or throws a 401-shaped error.
 async function getUserId(): Promise<string> {
   const session = await getServerSession(authOptions);
   if (!session?.user?.id) {
-    const err: any = new Error("Unauthorised");
+    const err = new Error("Unauthorised") as Error & { status?: number };
     err.status = 401;
     throw err;
   }
@@ -37,12 +40,16 @@ async function getUserId(): Promise<string> {
 // ── POST /api/folders/:id/share ───────────────────────────────────────────────
 export async function POST(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     const userId = await getUserId();
 
-    if (!ObjectId.isValid(params.id)) {
+    const { id } = await params;
+
+    
+
+    if (!ObjectId.isValid(id)) {
       return NextResponse.json({ error: "Invalid folder id" }, { status: 400 });
     }
 
@@ -51,7 +58,7 @@ export async function POST(
 
     // ── 1. Verify folder ownership ─────────────────────────────────────────
     const folder = await Folder.findOne({
-      _id:      params.id,
+      _id:      id,
       owner_id: userId,
     }).lean();
 
@@ -63,7 +70,7 @@ export async function POST(
     const reuseDeadline = new Date(now.getTime() + REUSE_THRESHOLD_MS);
 
     const existingShare = await FolderShare.findOne({
-      folderId:  params.id,
+      folderId:  id,
       owner_id:  userId,
       expiresAt: { $gt: reuseDeadline },
     }).lean();
@@ -80,7 +87,7 @@ export async function POST(
 
     // ── 3. Fetch all uploaded files in the folder ──────────────────────────
     const files = await File.find({
-      folderId: params.id,
+      folderId: id,
       owner_id: userId,
       status:   "uploaded",
     }).lean();
@@ -101,13 +108,15 @@ export async function POST(
           expiresIn: SHARE_TTL_SECONDS,
         });
 
+        const fileId = (file as LeanId)._id.toString();
+
         return {
-          fileId:      (file._id as any).toString(),
+          fileId,
           filename:    file.filename,
           mimetype:    file.mimetype,
           size:        file.size,
           url,
-          downloadUrl: buildDownloadUrl(req, (file._id as any).toString()),
+          downloadUrl: buildDownloadUrl(req, fileId),
         };
       })
     );
@@ -118,8 +127,8 @@ export async function POST(
     // ── 6. Persist the share manifest ─────────────────────────────────────
     await FolderShare.create({
       token,
-      folderId:   params.id,
-      folderName: (folder as any).name,
+      folderId:   id,
+      folderName: (folder as LeanFolderName).name,
       owner_id:   userId,
       files:      presignedFiles,
       expiresAt,
@@ -132,8 +141,8 @@ export async function POST(
       fileCount:  presignedFiles.length,
       reused:     false,
     });
-  } catch (err: any) {
-    if (err?.status === 401) {
+  } catch (err: unknown) {
+    if ((err as { status?: number })?.status === 401) {
       return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
     }
     console.error("[POST /api/folders/:id/share]", err);
@@ -144,12 +153,16 @@ export async function POST(
 // ── GET /api/folders/:id/share ────────────────────────────────────────────────
 export async function GET(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     const userId = await getUserId();
 
-    if (!ObjectId.isValid(params.id)) {
+    const { id } = await params;
+
+    
+
+    if (!ObjectId.isValid(id)) {
       return NextResponse.json({ error: "Invalid folder id" }, { status: 400 });
     }
 
@@ -157,7 +170,7 @@ export async function GET(
 
     const share = await FolderShare.findOne(
       {
-        folderId:  params.id,
+        folderId:  id,
         owner_id:  userId,
         expiresAt: { $gt: new Date() },
       },
@@ -176,8 +189,8 @@ export async function GET(
       expiresAt:  share.expiresAt,
       fileCount:  share.files?.length ?? 0,
     });
-  } catch (err: any) {
-    if (err?.status === 401) {
+  } catch (err: unknown) {
+    if ((err as { status?: number })?.status === 401) {
       return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
     }
     console.error("[GET /api/folders/:id/share]", err);
@@ -188,25 +201,29 @@ export async function GET(
 // ── DELETE /api/folders/:id/share ─────────────────────────────────────────────
 export async function DELETE(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     const userId = await getUserId();
 
-    if (!ObjectId.isValid(params.id)) {
+    const { id } = await params;
+
+    
+
+    if (!ObjectId.isValid(id)) {
       return NextResponse.json({ error: "Invalid folder id" }, { status: 400 });
     }
 
     await connectDB();
 
     const result = await FolderShare.deleteMany({
-      folderId: params.id,
+      folderId: id,
       owner_id: userId,
     });
 
     return NextResponse.json({ success: true, revoked: result.deletedCount });
-  } catch (err: any) {
-    if (err?.status === 401) {
+  } catch (err: unknown) {
+    if ((err as { status?: number })?.status === 401) {
       return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
     }
     console.error("[DELETE /api/folders/:id/share]", err);
@@ -225,3 +242,4 @@ function buildDownloadUrl(req: NextRequest, fileId: string): string {
   const base = process.env.NEXT_PUBLIC_APP_URL ?? `${req.nextUrl.protocol}//${req.nextUrl.host}`;
   return `${base}/api/files/${fileId}/download`;
 }
+

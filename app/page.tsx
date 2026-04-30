@@ -418,7 +418,7 @@ export default function LandingPage() {
         <div className="si-cta-box">
           <div className="si-cta-title">Start storing smarter today.</div>
           <div className="si-cta-sub">Free forever for personal use. No credit card needed. Upgrade anytime as your team grows.</div>
-          <button className="si-btn-white" onClick={() => router.push("/sign-up")}>
+          <button className="si-btn-white" onClick={() => router.push("/sign_up")}>
             Create your free account
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
               <path d="M3 8h10M8 3l5 5-5 5" stroke="#0F7B6C" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />

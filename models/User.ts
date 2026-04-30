@@ -22,8 +22,6 @@ const UserSchema = new mongoose.Schema({
 });
 
 
-UserSchema.index({ email: 1 });
-
 UserSchema.pre("save", async function () {
   if (!this.password || !this.isModified("password")) return
   const salt = await bcrypt.genSalt(10)

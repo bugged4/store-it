@@ -2,6 +2,7 @@
 
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
+import { useSession } from "next-auth/react";
 
 type FileType = {
   _id: string;
@@ -28,6 +29,8 @@ function formatBytes(bytes: number) {
 
 export default function ShowFilesPage() {
   const queryClient = useQueryClient();
+  const { status: sessionStatus } = useSession();
+  const isAuthenticated = sessionStatus === "authenticated";
 
   const [folderName, setFolderName] = useState("");
   const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
@@ -41,6 +44,7 @@ export default function ShowFilesPage() {
       if (!res.ok) throw new Error("Failed to fetch files");
       return res.json();
     },
+    enabled: isAuthenticated,
   });
 
   // 📁 Fetch folders
@@ -55,6 +59,7 @@ export default function ShowFilesPage() {
       if (!res.ok) throw new Error("Failed to fetch folders");
       return res.json();
     },
+    enabled: isAuthenticated,
   });
 
   // 🚀 Create folder mutation

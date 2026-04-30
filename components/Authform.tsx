@@ -95,7 +95,7 @@ async function onSubmit(data: FormValues) {
 
       toast.success("Account created!");
 
-      router.push("/login")
+      router.push("/sign_in")
 
     } else {
       // 🔵 LOGIN USER
@@ -114,7 +114,7 @@ async function onSubmit(data: FormValues) {
       router.push("/dashboard");
     }
 
-  } catch (error) {
+  } catch {
     toast.error("Server error");
   }
 }
@@ -246,7 +246,7 @@ async function onSubmit(data: FormValues) {
           <Button
             type="button"
             variant="secondary"
-                onClick={() => signIn("google", { callbackUrl: "/dashboard" })}
+            onClick={() => signIn("google", { callbackUrl: `${window.location.origin}/dashboard` })}
           >
             Sign In with Google
         

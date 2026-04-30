@@ -2,6 +2,7 @@
 import { useRouter } from "next/navigation";
 import { useState, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useSession } from "next-auth/react";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 type FileType = {
@@ -130,6 +131,8 @@ function formatDate(iso: string) {
 // ── Component ────────────────────────────────────────────────────────────────
 export default function ShowFilesPage() {
   const router = useRouter();
+  const { status: sessionStatus } = useSession();
+  const isAuthenticated = sessionStatus === "authenticated";
   const [activeId, setActiveId]   = useState("all");
   const [search, setSearch]       = useState("");
   const [shareUrl, setShareUrl]   = useState("");
@@ -152,6 +155,7 @@ export default function ShowFilesPage() {
       if (!res.ok) throw new Error("Failed");
       return res.json();
     },
+    enabled: isAuthenticated,
   });
 
   const uploaded = files.filter((f) => f.status === "uploaded");
@@ -691,7 +695,7 @@ export default function ShowFilesPage() {
         <div className="sf-overlay" onClick={() => setShareFile(null)}>
           <div className="sf-share-modal" onClick={(e) => e.stopPropagation()}>
             <div className="sf-share-title">🔗 Share file</div>
-            <div className="sf-share-sub">Anyone with this link can view "{shareFile.filename}"</div>
+            <div className="sf-share-sub">Anyone with this link can view &quot;{shareFile.filename}&quot;</div>
             {shareUrl ? (
               <div className="sf-share-url-wrap">
                 <input className="sf-share-url-input" readOnly value={shareUrl} />

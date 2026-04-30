@@ -2,6 +2,7 @@
 import { useRouter } from "next/navigation";
 import { useState, useRef, useEffect, DragEvent, ChangeEvent } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useSession } from "next-auth/react";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const SMALL_FILE_LIMIT = 10 * 1024 * 1024;
@@ -76,6 +77,8 @@ function getFileIcon(mimetype: string): string {
 export default function FileUpload() {
   const router = useRouter();
   const queryClient = useQueryClient();
+  const { status: sessionStatus } = useSession();
+  const isAuthenticated = sessionStatus === "authenticated";
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   // Upload state
   const [dragging, setDragging] = useState(false);
@@ -128,6 +131,7 @@ export default function FileUpload() {
       if (!res.ok) throw new Error("Failed to fetch files");
       return res.json();
     },
+    enabled: isAuthenticated,
   });
 
   const { data: folders = [], isLoading: foldersLoading } = useQuery<FolderType[]>({
@@ -137,6 +141,7 @@ export default function FileUpload() {
       if (!res.ok) throw new Error("Failed to fetch folders");
       return res.json();
     },
+    enabled: isAuthenticated,
   });
 
   const uploadedFiles = files.filter((f) => f.status === "uploaded");

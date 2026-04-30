@@ -75,11 +75,6 @@ export async function POST(req: NextRequest) {
       folderId,
       status: "pending",
     });
-    console.log({
-  region: process.env.AWS_REGION,
-  key: process.env.AWS_ACCESS_KEY_ID,
-  secret: process.env.AWS_SECRET_ACCESS_KEY,
-});
 
     const uploadUrl = await getSignedUrl(
       s3,

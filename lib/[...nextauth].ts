@@ -5,6 +5,11 @@ import connectDB from '@/lib/mongoose';
 import User from '@/models/User';
 import NextAuth, { NextAuthOptions } from 'next-auth';
 
+type AppAuthUser = {
+  storageused?: number;
+  storagelimit?: number;
+};
+
 export const authOptions: NextAuthOptions = {
   providers: [
     // ── Google OAuth ──────────────────────────────────────────────
@@ -27,9 +32,6 @@ export const authOptions: NextAuthOptions = {
         password: { label: 'Password', type: 'password' },
       },
    async authorize(credentials) {
-        console.log("Authorize function called");
-  console.log("Credentials received:", credentials);
-
         if (!credentials?.email || !credentials?.password) {
           throw new Error('Email and password are required');
         }
@@ -122,8 +124,9 @@ export const authOptions: NextAuthOptions = {
         if (account.provider === 'credentials') {
           // Credentials: all data already in the user object returned by authorize()
           token.id = user.id;
-          token.storageused = (user as any).storageused ?? 0;
-          token.storagelimit = (user as any).storagelimit ?? 5 * 1024 * 1024 * 1024;
+          const appUser = user as AppAuthUser;
+          token.storageused = appUser.storageused ?? 0;
+          token.storagelimit = appUser.storagelimit ?? 5 * 1024 * 1024 * 1024;
         }
 
         if (account.provider === 'google') {
@@ -164,7 +167,7 @@ export const authOptions: NextAuthOptions = {
   },
 
   secret: process.env.NEXTAUTH_SECRET,
-  debug: process.env.NODE_ENV === 'development',
+  debug: false,
 };
 
 export default NextAuth(authOptions);
